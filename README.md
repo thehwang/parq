@@ -18,7 +18,7 @@ $ pq sales.parquet '.country, .revenue where .country == "US"'
 (3 rows)
 ```
 
-[ ![GIF — replace with your own asciinema cast](https://placehold.co/800x300?text=demo+GIF+goes+here) ](#)
+![demo](assets/demo.gif)
 
 ## Why?
 
