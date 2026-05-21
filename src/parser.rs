@@ -47,7 +47,11 @@ pub fn compile(file: &str, query: &str, default_limit: usize) -> Result<String> 
         } else {
             format!(" LIMIT {}", default_limit)
         };
-        return Ok(format!("SELECT * FROM {src}{limit}", src = src, limit = limit));
+        return Ok(format!(
+            "SELECT * FROM {src}{limit}",
+            src = src,
+            limit = limit
+        ));
     }
 
     // Raw SQL pass-through (escape hatch for power users)
@@ -73,7 +77,10 @@ pub fn compile(file: &str, query: &str, default_limit: usize) -> Result<String> 
     };
 
     // Decide projection
-    let projection = match (proj_part, q.starts_with('.') || q.to_ascii_lowercase().starts_with("select ")) {
+    let projection = match (
+        proj_part,
+        q.starts_with('.') || q.to_ascii_lowercase().starts_with("select "),
+    ) {
         (Some(p), _) => parse_projection(p)?,
         (None, true) => parse_projection(q)?,
         (None, false) => "*".to_string(),
@@ -86,7 +93,11 @@ pub fn compile(file: &str, query: &str, default_limit: usize) -> Result<String> 
         _ => None,
     };
 
-    let mut sql = format!("SELECT {projection} FROM {src}", projection = projection, src = src);
+    let mut sql = format!(
+        "SELECT {projection} FROM {src}",
+        projection = projection,
+        src = src
+    );
     if let Some(f) = filter_clause {
         sql.push_str(&format!(" WHERE {}", f));
     }

@@ -23,7 +23,8 @@ impl OutputFormat {
             "json" => OutputFormat::Json,
             "ndjson" => OutputFormat::Ndjson,
             "csv" => OutputFormat::Csv,
-            "auto" | _ => {
+            _ => {
+                // "auto" and any unknown name fall here.
                 if io::stdout().is_terminal() {
                     OutputFormat::Table
                 } else {
@@ -51,10 +52,7 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
         )
     })?;
 
-    let column_names: Vec<String> = rows
-        .as_ref()
-        .map(|s| s.column_names())
-        .unwrap_or_default();
+    let column_names: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
     let ncols = column_names.len();
 
     let mut collected: Vec<Vec<Value>> = Vec::new();
@@ -79,7 +77,7 @@ fn print_table(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
     table
         .load_preset(UTF8_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(cols.iter().map(|c| Cell::new(c)));
+        .set_header(cols.iter().map(Cell::new));
 
     for r in rows {
         table.add_row(r.iter().map(|v| Cell::new(value_to_display(v))));
