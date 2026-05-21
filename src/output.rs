@@ -1,4 +1,4 @@
-// Output rendering: pretty TUI table for terminals, JSON / NDJSON / CSV for pipes.
+// Output rendering: pretty TUI table for terminals, JSON / NDJSON / CSV / Parquet for pipes.
 
 use anyhow::{Context, Result};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
@@ -7,12 +7,13 @@ use duckdb::Connection;
 use serde_json::{Map, Value as JsonValue};
 use std::io::{self, IsTerminal, Write};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
     Table,
     Json,
     Ndjson,
     Csv,
+    Parquet,
 }
 
 impl OutputFormat {
@@ -23,6 +24,7 @@ impl OutputFormat {
             "json" => OutputFormat::Json,
             "ndjson" => OutputFormat::Ndjson,
             "csv" => OutputFormat::Csv,
+            "parquet" => OutputFormat::Parquet,
             _ => {
                 // "auto" and any unknown name fall here.
                 if io::stdout().is_terminal() {
@@ -36,6 +38,10 @@ impl OutputFormat {
 }
 
 pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<()> {
+    if fmt == OutputFormat::Parquet {
+        return run_parquet(conn, sql);
+    }
+
     let mut stmt = conn.prepare(sql).with_context(|| {
         format!(
             "DuckDB rejected the generated SQL.\n  SQL: {}\n  hint: re-run with --explain to inspect.",
@@ -69,7 +75,50 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
         OutputFormat::Json => print_json(&column_names, &collected),
         OutputFormat::Ndjson => print_ndjson(&column_names, &collected),
         OutputFormat::Csv => print_csv(&column_names, &collected),
+        OutputFormat::Parquet => unreachable!("Parquet handled before row iteration"),
     }
+}
+
+/// Write the query result as a parquet file to stdout.
+///
+/// We can't pipe DuckDB's COPY TO directly to stdout because parquet's footer
+/// (with column-chunk byte offsets) is written last and requires a seekable
+/// file descriptor. So: COPY to a temp file, then `io::copy` it to stdout, then
+/// best-effort delete the temp file. The cost (one extra disk write) is
+/// negligible vs. the alternative of buffering the whole result in memory.
+fn run_parquet(conn: &Connection, sql: &str) -> Result<()> {
+    let pid = std::process::id();
+    // Use a nanosecond timestamp to avoid collisions if multiple pq's race.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("pq-{pid}-{nanos}.parquet"));
+
+    // RAII cleanup: delete temp file even if we panic / error mid-stream.
+    struct TmpFile<'a>(&'a std::path::Path);
+    impl Drop for TmpFile<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _guard = TmpFile(&tmp);
+
+    let escaped = tmp.to_string_lossy().replace('\'', "''");
+    let copy_sql = format!("COPY ({sql}) TO '{escaped}' (FORMAT PARQUET)");
+    conn.execute_batch(&copy_sql).with_context(|| {
+        format!(
+            "DuckDB failed to write parquet output.\n  SQL: {}\n  hint: re-run with --explain to inspect.",
+            copy_sql
+        )
+    })?;
+
+    let mut f = std::fs::File::open(&tmp)
+        .with_context(|| format!("failed to open temp parquet at {}", tmp.display()))?;
+    let stdout = io::stdout();
+    let mut h = stdout.lock();
+    io::copy(&mut f, &mut h).context("failed to stream parquet to stdout")?;
+    Ok(())
 }
 
 fn print_table(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {

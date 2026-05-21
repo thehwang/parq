@@ -34,19 +34,22 @@ printf '\033[H\033[2J'  # clear screen via ANSI (works even without a real TTY)
 printf '\033[1;36m# pq -- jq for Parquet. Watch this.\033[0m\n\n'
 sleep 1.5
 
-# For pretty tables, force -o table on the displayed-as-pretty commands.
-# The pipe demo intentionally relies on auto → ndjson when piped.
+# Force -o table on the displayed-as-pretty commands.
+# Pipe demos intentionally rely on auto → ndjson when piped.
 typeit "pq sample.parquet" \
        "$PQ -o table sample.parquet"
 
 typeit "pq sample.parquet '.email where .country == \"US\"'" \
        "$PQ -o table sample.parquet '.email where .country == \"US\"'"
 
+typeit "pq sample.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'" \
+       "$PQ -o table sample.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'"
+
 typeit "pq schema sample.parquet" \
        "$PQ -o table schema sample.parquet"
 
-typeit "pq stats sample.parquet" \
-       "$PQ -o table stats sample.parquet"
+typeit "pq sample.parquet 'where .country == \"US\"' -o parquet > /tmp/us.parquet && pq /tmp/us.parquet" \
+       "$PQ sample.parquet 'where .country == \"US\"' -o parquet > /tmp/us.parquet && $PQ -o table /tmp/us.parquet"
 
 typeit "pq sample.parquet '.email' | head -3" \
        "$PQ sample.parquet '.email' | head -3"

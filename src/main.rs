@@ -1,16 +1,27 @@
 // pq — jq for Parquet
 //
 // Usage examples:
-//   pq file.parquet                       # head 20 + schema
-//   pq file.parquet '.user.id'            # extract column
-//   pq file.parquet 'country == "US"'     # filter rows
-//   pq file.parquet '.email where .country == "US"'
-//   pq schema file.parquet
-//   pq stats  file.parquet
-//   pq count  file.parquet
-//   pq sample file.parquet -n 10
+//   pq file.parquet                                  # head 20
+//   pq file.parquet '.user.id'                       # extract column
+//   pq file.parquet 'country == "US"'                # filter rows
+//   pq file.parquet '.email where .country == "US"'  # both (v0 inline)
 //
-// Backends: DuckDB (embedded). Reads local paths, globs, gs://, s3://.
+//   # Pipe-stage syntax (v0.2):
+//   pq f.parquet 'group_by .country | count | top 10 by count'
+//   pq f.parquet 'where .age > 18 | group_by .country | avg .revenue'
+//   pq f.parquet '.country | distinct'
+//   pq f.parquet '.country, .revenue | sort by .revenue desc | limit 5'
+//
+//   # Globs auto-expand via DuckDB:
+//   pq 'data/dt=2026-*/*.parquet' 'group_by .dt | count'
+//
+//   # Subcommands:
+//   pq schema | stats | count | sample | head | tail   <file>
+//
+//   # Export back to parquet (full file, no LIMIT):
+//   pq big.parquet '.country == "US"' -o parquet > us.parquet
+//
+// Backends: DuckDB (embedded). Reads local paths, globs, gs://, s3://, az://.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -23,19 +34,31 @@ use crate::output::OutputFormat;
 use crate::parser::compile;
 
 #[derive(Parser, Debug)]
-#[command(name = "pq", version, about = "jq for Parquet", long_about = None)]
+#[command(
+    name = "pq",
+    version,
+    about = "jq for Parquet",
+    long_about = None,
+    // If user supplies positional args (file/query), don't try to interpret
+    // the second positional as a subcommand. So `pq f.parquet count` parses
+    // as (file=f.parquet, query=count) instead of routing to Cmd::Count.
+    args_conflicts_with_subcommands = true,
+)]
 struct Cli {
     /// Input parquet (local path, glob, gs://, s3://, az://) or "-" for stdin
     file: Option<String>,
 
-    /// Query expression (jq-like): `.col`, `expr == "v"`, `.col where expr`
+    /// Query expression. Stages are separated by `|`.
+    /// Supported verbs: select, where, group_by, count, sum/avg/min/max,
+    /// count_distinct, top N by, sort by, limit, head, distinct.
     query: Option<String>,
 
-    /// Output: auto | table | json | ndjson | csv
+    /// Output: auto | table | json | ndjson | csv | parquet
     #[arg(short, long, default_value = "auto")]
     output: String,
 
     /// Row limit for default head; default 20. Use 0 for no limit.
+    /// (Auto-disabled when -o parquet, so full exports work as expected.)
     #[arg(short = 'n', long, default_value_t = 20)]
     n: usize,
 
@@ -91,7 +114,13 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("a parquet file is required (try: pq <file>)"))?;
     let query = cli.query.as_deref().unwrap_or("");
 
-    let sql = compile(file, query, cli.n)?;
+    // For parquet export, the user almost never wants the default head LIMIT.
+    let effective_n = if fmt == OutputFormat::Parquet {
+        0
+    } else {
+        cli.n
+    };
+    let sql = compile(file, query, effective_n)?;
 
     if cli.explain {
         println!("{}", sql);

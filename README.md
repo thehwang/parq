@@ -7,14 +7,14 @@
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
 ```bash
-$ pq sales.parquet '.country, .revenue where .country == "US"'
-┌─────────┬─────────┐
-│ country ┆ revenue │
-╞═════════╪═════════╡
-│ US      ┆ 1245.00 │
-│ US      ┆ 89.50   │
-│ US      ┆ 17820.00│
-└─────────┴─────────┘
+$ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
+┌─────────┬─────────────┐
+│ country ┆ sum_revenue │
+╞═════════╪═════════════╡
+│ US      ┆ 19065.00    │
+│ FR      ┆ 999.99      │
+│ DE      ┆ 312.00      │
+└─────────┴─────────────┘
 (3 rows)
 ```
 
@@ -51,58 +51,123 @@ cargo build --release
 
 ## Quickstart
 
+### Single-stage (the v0 way — still supported)
+
 ```bash
-# Default: head 20 + schema overview
-pq users.parquet
+pq users.parquet                                  # head 20
+pq users.parquet '.email'                         # one column
+pq users.parquet '.user.id'                       # nested struct path
+pq users.parquet '.email, .name, .country'        # multi
+pq users.parquet 'country == "US"'                # filter only
+pq users.parquet '.email where .country == "US"'  # both
+```
 
-# Project: jq-style dot syntax (nested OK)
-pq users.parquet '.email'
-pq users.parquet '.user.id'
-pq users.parquet '.email, .name, .country'
-pq users.parquet 'select .email, .name'      # SQL-style alt
+### Pipe stages (the killer feature)
 
-# Filter rows
-pq users.parquet 'country == "US"'
-pq users.parquet '.email where .country == "US"'
+Stages are separated by `|`. Output of one stage flows into the next.
 
-# Common ops
-pq schema  users.parquet
-pq stats   users.parquet
+```bash
+# Top countries by revenue
+pq sales.parquet 'group_by .country | sum .revenue | top 10 by sum_revenue'
+
+# Filter, group, having
+pq users.parquet 'where .age > 18 | group_by .country | count | where count > 100'
+
+# Distinct values
+pq logs.parquet '.user_id | distinct | sort by .user_id'
+
+# Multi-aggregate
+pq events.parquet 'group_by .country | count | sum .duration | avg .duration'
+```
+
+| Verb | Example | SQL emitted |
+|---|---|---|
+| `where EXPR` | `where .age > 18` | `WHERE age > 18` (or `HAVING` after group_by) |
+| `select .col, .col2` | `select .email, .name` | `SELECT email, name` |
+| `group_by .col[, .col2]` | `group_by .country` | `GROUP BY country` |
+| `count` / `count_distinct .col` | `count_distinct .npi` | `count(DISTINCT npi) AS count_distinct_npi` |
+| `sum/avg/min/max .col` | `sum .revenue` | `sum(revenue) AS sum_revenue` |
+| `top N by COL [asc\|desc]` | `top 10 by sum_revenue` | `ORDER BY sum_revenue DESC LIMIT 10` |
+| `sort by .col [asc\|desc]` | `sort by .revenue desc` | `ORDER BY revenue DESC` |
+| `limit N` / `head N` | `limit 5` | `LIMIT 5` |
+| `distinct` | `distinct` | `SELECT DISTINCT` |
+
+### Subcommands
+
+```bash
+pq schema  users.parquet     # column names + types + nullable
+pq stats   users.parquet     # min, max, approx_distinct, null_pct per col
 pq sample  users.parquet -n 10
 pq head    users.parquet -n 5
+pq tail    users.parquet -n 5
 pq count   users.parquet
+```
 
-# Cloud paths — DuckDB's httpfs handles auth via env vars
+### Cloud paths & globs
+
+DuckDB's `read_parquet` handles all of these natively:
+
+```bash
 pq gs://bucket/file.parquet '.email'
-pq s3://bucket/dt=2026-05-*/*.parquet 'count'
 
-# Pipes — auto-switches to NDJSON for downstream tools
-pq users.parquet '.email' | jq -r 'select(. | endswith("@cadent.tv"))'
+# Globs (quote them so the shell doesn't expand first)
+pq 'data/dt=2026-*/*.parquet' 'group_by .dt | count'
+
+# Hive partitioned
+pq 'events/year=2026/month=*/*.parquet' 'count'
+```
+
+### Pipe-friendly
+
+`pq` auto-detects whether stdout is a TTY:
+
+```bash
+pq users.parquet '.email' | jq -r 'select(endswith("@cadent.tv"))'
 pq users.parquet | head -3
+```
 
-# Output formats
+### Output formats
+
+```bash
 pq users.parquet -o csv > out.csv
 pq users.parquet -o json
 pq users.parquet -o ndjson
-pq users.parquet -o table
 
-# Escape hatch: full DuckDB SQL when you need it
+# Export back to parquet (auto-disables default LIMIT)
+pq big.parquet 'where .country == "US"' -o parquet > us.parquet
+```
+
+### Escape hatch
+
+When the DSL doesn't cover what you need, drop into raw SQL:
+
+```bash
 pq users.parquet 'SELECT country, count(*) FROM FILE GROUP BY country ORDER BY 2 DESC'
+# `FILE` is substituted with read_parquet('users.parquet')
 ```
 
-## Syntax
+## Grammar
 
 ```
-query        := projection
-              | filter_expr
-              | projection 'where' filter_expr
-              | raw_sql                   -- starts with SELECT/WITH; FILE = the input
-              | <empty>                   -- => head 20
+query        := stage ( '|' stage )*
+              | raw_sql                          -- starts with SELECT/WITH
+              | <empty>                          -- => head LIMIT n
 
-projection   := ('select')? '.' ident ( ',' '.' ident )*
-              | '.' ident ( '.' ident )*  -- nested struct path
+stage        := projection                       -- '.col, .col2'
+              | filter_expr                      -- 'country == "US"'
+              | projection 'where' filter_expr   -- v0 inline shorthand
+              | 'where' filter_expr
+              | 'select' projection
+              | 'group_by' '.' ident (',' '.' ident)*
+              | 'count'
+              | ('sum'|'avg'|'min'|'max'|'count_distinct') '.' ident
+              | 'top' INT 'by' col [ asc | desc ]
+              | 'sort by' col [ asc | desc ]
+              | 'limit' INT
+              | 'distinct'
 
-filter_expr  := <DuckDB SQL fragment>     -- with sugar:
+filter_expr  := <DuckDB SQL fragment>            -- with sugar:
+                  "..."   → '...'  (jq strings → SQL string literals)
                   ==      → =
                   !=      → <>
                   bare .col → col
@@ -122,15 +187,21 @@ schema dump           ✓        ✓            ✓      ✓         ✓
 streams large files   ✓        ✓            ✓      partial   ✓
 ```
 
-## What's coming
+## What's done (v0.2)
 
-- [ ] Glob expansion: `pq 'data/dt=2026-*/*.parquet' 'count'`
-- [ ] Aggregations sugar: `pq f.parquet 'group_by .country | count'`
-- [ ] Sorting sugar: `pq f.parquet 'top 10 by .revenue'`
+- [x] Glob expansion: `pq 'data/dt=2026-*/*.parquet' 'count'`
+- [x] Aggregation sugar: `group_by`, `count`, `sum/avg/min/max`, `count_distinct`
+- [x] Sorting sugar: `top N by .col`, `sort by .col [desc]`
+- [x] Output to parquet: `pq a.parquet 'where .country == "US"' -o parquet > us.parquet`
+- [x] Pipe stages with WHERE/HAVING auto-routing
+
+## What's coming (v0.3+)
+
 - [ ] Join sugar (multi-file): `pq a.parquet join b.parquet on .user_id`
-- [ ] Watch mode: `pq -w f.parquet 'count'`
-- [ ] Output to parquet: `pq a.parquet '.country == "US"' -o parquet > us.parquet`
-- [ ] Partitioned hive scan with auto-discovery
+- [ ] Watch mode: `pq -w 'data/*.parquet' 'count'`
+- [ ] Partitioned hive scan with `--hive` auto-discovery
+- [ ] `to_csv .col` / `to_json` per-row output sugar
+- [ ] Scalar UDFs: `pq f.parquet 'where regex_match(.email, "@cadent")'`
 
 ## Limitations (v0)
 
