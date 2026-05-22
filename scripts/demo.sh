@@ -48,8 +48,13 @@ typeit "pq sample.parquet 'group_by .country | sum .revenue | top 3 by sum_reven
 typeit "pq schema sample.parquet" \
        "$PQ -o table schema sample.parquet"
 
-typeit "pq sample.parquet 'where .country == \"US\"' -o parquet > /tmp/us.parquet && pq /tmp/us.parquet" \
-       "$PQ sample.parquet 'where .country == \"US\"' -o parquet > /tmp/us.parquet && $PQ -o table /tmp/us.parquet"
+# v0.3: hive partitioning auto-detects from key=value path segments.
+typeit "pq 'sales/dt=*/region=*/*.parquet' 'group_by .dt, .region | count | sum .amount'" \
+       "$PQ -o table 'sales/dt=*/region=*/*.parquet' 'group_by .dt, .region | count | sum .amount | sort by .dt asc'"
+
+# v0.3: single-column equi-join across two parquet files.
+typeit "pq sample.parquet 'join \"orders.parquet\" on .a.id == .b.user_id | group_by .a.country | sum .b.amount'" \
+       "$PQ -o table sample.parquet 'join \"orders.parquet\" on .a.id == .b.user_id | group_by .a.country | count | sum .b.amount | sort by .sum_b_amount desc'"
 
 typeit "pq sample.parquet '.email' | head -3" \
        "$PQ sample.parquet '.email' | head -3"

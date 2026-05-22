@@ -66,6 +66,11 @@ struct Cli {
     #[arg(long)]
     explain: bool,
 
+    /// Watch mode: re-run the query every N seconds (clearing the screen between
+    /// runs). Useful for live dashboards on directories that get new files.
+    #[arg(short = 'w', long, value_name = "SECS")]
+    watch: Option<u64>,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -101,11 +106,36 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let conn = open_conn()?;
-
     let fmt = OutputFormat::resolve(&cli.output);
 
-    if let Some(cmd) = cli.command {
-        return run_subcommand(&conn, cmd, fmt);
+    // Watch mode wraps execution in a loop with an ANSI screen-clear before each tick.
+    if let Some(secs) = cli.watch {
+        if secs == 0 {
+            return Err(anyhow!("--watch interval must be > 0"));
+        }
+        let start = std::time::Instant::now();
+        let mut tick: u64 = 0;
+        loop {
+            tick += 1;
+            // \x1b[2J clears the screen, \x1b[H homes the cursor.
+            print!("\x1b[2J\x1b[H");
+            eprintln!(
+                "── pq watch — tick #{tick}, {:.0}s elapsed, every {secs}s — Ctrl-C to stop ──",
+                start.elapsed().as_secs_f64()
+            );
+            if let Err(e) = run_query(&cli, &conn, fmt) {
+                eprintln!("error: {e:#}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        }
+    }
+
+    run_query(&cli, &conn, fmt)
+}
+
+fn run_query(cli: &Cli, conn: &Connection, fmt: OutputFormat) -> Result<()> {
+    if let Some(cmd) = cli.command.as_ref() {
+        return run_subcommand(conn, cmd, fmt);
     }
 
     let file = cli
@@ -127,7 +157,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    output::run_and_print(&conn, &sql, fmt)
+    output::run_and_print(conn, &sql, fmt)
 }
 
 fn open_conn() -> Result<Connection> {
@@ -143,40 +173,40 @@ fn open_conn() -> Result<Connection> {
     Ok(conn)
 }
 
-fn run_subcommand(conn: &Connection, cmd: Cmd, fmt: OutputFormat) -> Result<()> {
+fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat) -> Result<()> {
     let sql = match cmd {
         Cmd::Schema { file } => format!(
             "SELECT column_name, column_type, \"null\" AS nullable \
              FROM (DESCRIBE SELECT * FROM {src})",
-            src = parser::source_clause(&file)
+            src = parser::source_clause(file)
         ),
         Cmd::Stats { file } => format!(
             "SELECT column_name, column_type, min, max, \
                     approx_unique AS approx_distinct, \
                     null_percentage AS null_pct \
              FROM (SUMMARIZE SELECT * FROM {src})",
-            src = parser::source_clause(&file)
+            src = parser::source_clause(file)
         ),
         Cmd::Sample { file, n } => format!(
             "SELECT * FROM {src} USING SAMPLE {n} ROWS",
-            src = parser::source_clause(&file),
+            src = parser::source_clause(file),
             n = n
         ),
         Cmd::Head { file, n } => format!(
             "SELECT * FROM {src} LIMIT {n}",
-            src = parser::source_clause(&file),
+            src = parser::source_clause(file),
             n = n
         ),
         Cmd::Tail { file, n } => format!(
             "WITH t AS (SELECT *, row_number() OVER () AS __rn FROM {src}) \
              SELECT * EXCLUDE (__rn) FROM t \
              ORDER BY __rn DESC LIMIT {n}",
-            src = parser::source_clause(&file),
+            src = parser::source_clause(file),
             n = n
         ),
         Cmd::Count { file } => format!(
             "SELECT count(*) AS rows FROM {src}",
-            src = parser::source_clause(&file)
+            src = parser::source_clause(file)
         ),
     };
 

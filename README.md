@@ -37,8 +37,10 @@ The current options for ad-hoc parquet querying are all painful:
 ## Install
 
 ```bash
-# macOS / Linux (tap coming)
-brew install thehwang/parq/pq
+# Prebuilt binary — macOS arm64 / x86_64 / Linux musl
+# (replace the asset name to match your platform; SHA256 sidecars are next to each archive)
+curl -L https://github.com/thehwang/parq/releases/latest/download/pq-aarch64-apple-darwin.tar.gz \
+  | tar xz && sudo mv pq /usr/local/bin/
 
 # from source
 cargo install pq
@@ -103,7 +105,7 @@ pq tail    users.parquet -n 5
 pq count   users.parquet
 ```
 
-### Cloud paths & globs
+### Cloud paths, globs, hive auto-discovery
 
 DuckDB's `read_parquet` handles all of these natively:
 
@@ -112,17 +114,50 @@ pq gs://bucket/file.parquet '.email'
 
 # Globs (quote them so the shell doesn't expand first)
 pq 'data/dt=2026-*/*.parquet' 'group_by .dt | count'
-
-# Hive partitioned
-pq 'events/year=2026/month=*/*.parquet' 'count'
 ```
+
+**Hive partitioning auto-detects.** Any path containing a `key=value` segment
+turns the partition keys into normal columns you can group/filter on:
+
+```bash
+# 'sales/dt=2026-05-20/region=US/part-0.parquet' — pq sees dt + region columns automatically
+pq 'sales/dt=*/region=*/*.parquet' 'group_by .dt, .region | count | sum .amount'
+```
+
+### Joins
+
+Single equi-join, two shapes — bare `.col` for matching column names, explicit
+`.a.x == .b.y` otherwise. Left side is `a`, right side is `b`:
+
+```bash
+# Same column name on both sides
+pq orders.parquet 'join "users.parquet" on .user_id | select .a.amount, .b.email'
+
+# Different column names (users.id ↔ orders.user_id)
+pq users.parquet 'join "orders.parquet" on .a.id == .b.user_id \
+                  | group_by .a.country | count | sum .b.amount | sort by .sum_b_amount desc'
+```
+
+The right side also supports cloud URIs and hive auto-discovery.
+
+### Watch mode
+
+Re-runs the query every N seconds with a screen-clear between ticks. Drop it
+on a directory that's actively being written to:
+
+```bash
+pq -w 5 'data/dt=2026-*/*.parquet' 'group_by .dt | count | sort by .dt desc | limit 5'
+```
+
+`Ctrl-C` to stop. The status line on stderr reports the tick count + elapsed
+time so you can tell it's alive.
 
 ### Pipe-friendly
 
 `pq` auto-detects whether stdout is a TTY:
 
 ```bash
-pq users.parquet '.email' | jq -r 'select(endswith("@cadent.tv"))'
+pq users.parquet '.email' | jq -r 'select(endswith("@example.org"))'
 pq users.parquet | head -3
 ```
 
@@ -165,6 +200,9 @@ stage        := projection                       -- '.col, .col2'
               | 'sort by' col [ asc | desc ]
               | 'limit' INT
               | 'distinct'
+              | 'join' '"' path '"' 'on' join_clause   -- v0.3
+join_clause  := '.' ident                              -- shorthand: a.col = b.col
+              | filter_expr                            -- explicit, must contain '='
 
 filter_expr  := <DuckDB SQL fragment>            -- with sugar:
                   "..."   → '...'  (jq strings → SQL string literals)
@@ -187,21 +225,29 @@ schema dump           ✓        ✓            ✓      ✓         ✓
 streams large files   ✓        ✓            ✓      partial   ✓
 ```
 
-## What's done (v0.2)
+## What's done
 
+**v0.3** (current)
+- [x] Hive partitioning auto-detects from `key=value` path segments — no flag needed
+- [x] Single equi-join: `'join "b.parquet" on .col'` and `'join "b.parquet" on .a.x == .b.y'`
+- [x] Watch mode: `pq -w 5 file.parquet 'count'` re-runs every N seconds
+- [x] Date32 columns now display as `YYYY-MM-DD` (not `date(days=20592)`)
+- [x] Prebuilt binaries on every tag — macOS arm64/x86_64 + Linux musl
+
+**v0.2**
 - [x] Glob expansion: `pq 'data/dt=2026-*/*.parquet' 'count'`
 - [x] Aggregation sugar: `group_by`, `count`, `sum/avg/min/max`, `count_distinct`
 - [x] Sorting sugar: `top N by .col`, `sort by .col [desc]`
 - [x] Output to parquet: `pq a.parquet 'where .country == "US"' -o parquet > us.parquet`
 - [x] Pipe stages with WHERE/HAVING auto-routing
 
-## What's coming (v0.3+)
+## What's coming (v0.4+)
 
-- [ ] Join sugar (multi-file): `pq a.parquet join b.parquet on .user_id`
-- [ ] Watch mode: `pq -w 'data/*.parquet' 'count'`
-- [ ] Partitioned hive scan with `--hive` auto-discovery
+- [ ] LEFT/RIGHT/FULL OUTER joins (currently INNER only)
+- [ ] Multi-key join: `'join "b.parquet" on .a.x == .b.x and .a.y == .b.y'`
 - [ ] `to_csv .col` / `to_json` per-row output sugar
-- [ ] Scalar UDFs: `pq f.parquet 'where regex_match(.email, "@cadent")'`
+- [ ] Scalar UDFs: `pq f.parquet 'where regex_match(.email, "@example\\.org")'`
+- [ ] Homebrew tap (`brew install thehwang/parq/pq`)
 
 ## Limitations (v0)
 

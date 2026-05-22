@@ -41,13 +41,62 @@ use anyhow::{anyhow, Result};
 // ─── Source ──────────────────────────────────────────────────────────────────
 
 /// Wrap a path/URI into a DuckDB FROM-clause-friendly source expression.
+///
+/// Hive partitioning (`hive_partitioning=true`) auto-enables when the path
+/// contains a hive-style segment like `dt=2026-05-21` — this lets the user
+/// query partition columns without any flag, e.g.:
+///   pq 'sales/dt=2026-*/region=*/*.parquet' 'group_by .dt, .region | count'
 pub fn source_clause(file: &str) -> String {
     let f = file.trim();
     if f == "-" {
         return "read_parquet('/dev/stdin')".to_string();
     }
     let escaped = f.replace('\'', "''");
-    format!("read_parquet('{}')", escaped)
+    let hive = looks_like_hive_partition(f);
+    if hive {
+        format!("read_parquet('{}', hive_partitioning=true)", escaped)
+    } else {
+        format!("read_parquet('{}')", escaped)
+    }
+}
+
+/// Make a column expression safe to embed inside a SQL alias name.
+///
+/// We use `<col>` to derive auto-alias names for aggregates (e.g. `sum_amount`).
+/// When `<col>` is a qualified name like `b.amount`, the naive concatenation
+/// `sum_b.amount` is invalid SQL — DuckDB parses the dot as a struct accessor.
+/// Replace any non-identifier character with `_` to keep the alias parseable.
+fn alias_safe(col: &str) -> String {
+    col.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Heuristic: does the path contain at least one `name=value` directory segment?
+/// We deliberately scan just the path bytes — works for local paths, gs://, s3://.
+fn looks_like_hive_partition(path: &str) -> bool {
+    for segment in path.split('/') {
+        if let Some(eq_idx) = segment.find('=') {
+            // Must have an identifier-ish key on the left and SOMETHING on the right.
+            let key = &segment[..eq_idx];
+            let val = &segment[eq_idx + 1..];
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && !val.is_empty()
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─── Plan ────────────────────────────────────────────────────────────────────
@@ -66,18 +115,34 @@ impl Aggregate {
     fn sql(&self) -> String {
         match self {
             Aggregate::Count => "count(*) AS count".into(),
-            Aggregate::CountDistinct(c) => format!("count(DISTINCT {c}) AS count_distinct_{c}"),
-            Aggregate::Sum(c) => format!("sum({c}) AS sum_{c}"),
-            Aggregate::Avg(c) => format!("avg({c}) AS avg_{c}"),
-            Aggregate::Min(c) => format!("min({c}) AS min_{c}"),
-            Aggregate::Max(c) => format!("max({c}) AS max_{c}"),
+            Aggregate::CountDistinct(c) => {
+                format!("count(DISTINCT {c}) AS count_distinct_{}", alias_safe(c))
+            }
+            Aggregate::Sum(c) => format!("sum({c}) AS sum_{}", alias_safe(c)),
+            Aggregate::Avg(c) => format!("avg({c}) AS avg_{}", alias_safe(c)),
+            Aggregate::Min(c) => format!("min({c}) AS min_{}", alias_safe(c)),
+            Aggregate::Max(c) => format!("max({c}) AS max_{}", alias_safe(c)),
         }
     }
+}
+
+/// Single equi-join. Reference left/right sides as `.a.col` / `.b.col` in
+/// subsequent stages.
+///
+/// `on_expr` is a complete SQL ON clause body (e.g. `a.id = b.user_id`), already
+/// rewritten from the user's DSL form. Supports two input shapes:
+///   `on .col`               ─ shorthand for `a.col = b.col`
+///   `on .a.id == .b.user_id` ─ explicit (must contain `=` or `==`)
+#[derive(Debug, Clone)]
+pub struct Join {
+    pub right_source: String,
+    pub on_expr: String,
 }
 
 #[derive(Debug, Default)]
 pub struct QueryPlan {
     pub source: String,           // "read_parquet('...')"
+    pub join: Option<Join>,       // a single INNER JOIN (left = `a`, right = `b`)
     pub projections: Vec<String>, // explicit SELECT columns (non-aggregate)
     pub aggregates: Vec<Aggregate>,
     pub filters: Vec<String>, // WHERE
@@ -127,6 +192,14 @@ impl QueryPlan {
         sql.push_str(&self.select_list());
         sql.push_str(" FROM ");
         sql.push_str(&self.source);
+
+        // INNER JOIN (single, equi-join, aliases left=a / right=b).
+        if let Some(j) = &self.join {
+            sql.push_str(" AS a INNER JOIN ");
+            sql.push_str(&j.right_source);
+            sql.push_str(" AS b ON ");
+            sql.push_str(&j.on_expr);
+        }
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
@@ -299,6 +372,48 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
     // distinct (bare)
     if lower == "distinct" {
         plan.distinct = true;
+        return Ok(());
+    }
+
+    // join "PATH" on .col   →   INNER JOIN read_parquet('PATH') AS b ON a.col = b.col
+    // After a join, columns are referenced as `.a.col` / `.b.col` in subsequent stages.
+    if let Some(rest) = strip_keyword(s, "join") {
+        if plan.join.is_some() {
+            return Err(anyhow!(
+                "multiple joins are not supported yet (v0.3); fall back to raw SQL via SELECT/WITH for chained joins"
+            ));
+        }
+        let (path_raw, on_part) = rest.split_once(" on ").ok_or_else(|| {
+            anyhow!("`join` needs `on .col`: `join \"file.parquet\" on .user_id`")
+        })?;
+        let path = path_raw.trim().trim_matches('"').trim_matches('\'').trim();
+        if path.is_empty() {
+            return Err(anyhow!("`join` needs a quoted file path"));
+        }
+        // source_clause() handles cloud URIs + hive auto-detection on the right side.
+        let right_source = source_clause(path);
+
+        // Two on-clause shapes:
+        //   `on .col`              → a.col = b.col       (shorthand for matching col names)
+        //   `on .a.x == .b.y`      → a.x = b.y           (any expression containing '=')
+        let on_expr = if on_part.contains('=') {
+            let rewritten = rewrite_filter(on_part);
+            let trimmed = rewritten.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(anyhow!("`join on` clause is empty"));
+            }
+            trimmed
+        } else {
+            let col = strip_dot(on_part);
+            if col.is_empty() {
+                return Err(anyhow!("`join` needs a column name after `on`"));
+            }
+            format!("a.{col} = b.{col}")
+        };
+        plan.join = Some(Join {
+            right_source,
+            on_expr,
+        });
         return Ok(());
     }
 
@@ -725,10 +840,106 @@ mod tests {
     }
 
     #[test]
-    fn glob_path_passthrough() {
+    fn glob_path_passthrough_with_hive_autodetect() {
+        // 'dt=...' segment triggers hive_partitioning=true automatically.
         let s = cmp("data/dt=2026-*/*.parquet", "count", 20);
-        assert!(s.contains("read_parquet('data/dt=2026-*/*.parquet')"));
+        assert!(
+            s.contains("read_parquet('data/dt=2026-*/*.parquet', hive_partitioning=true)"),
+            "got: {}",
+            s
+        );
         assert!(s.contains("count(*)"));
+    }
+
+    #[test]
+    fn plain_path_no_hive() {
+        let s = cmp("data/2026/05/file.parquet", "count", 20);
+        assert!(s.contains("read_parquet('data/2026/05/file.parquet')"));
+        assert!(!s.contains("hive_partitioning"));
+    }
+
+    #[test]
+    fn nested_hive_partitions() {
+        let s = cmp("sales/dt=2026-05/region=US/*.parquet", "count", 20);
+        assert!(s.contains("hive_partitioning=true"));
+    }
+
+    #[test]
+    fn hive_path_supports_partition_column_in_query() {
+        let s = cmp(
+            "sales/dt=2026-*/region=*/*.parquet",
+            "group_by .dt, .region | count",
+            20,
+        );
+        // Hive turns dt/region into normal columns DuckDB can group_by.
+        assert!(s.contains("GROUP BY dt, region"));
+        assert!(s.contains("hive_partitioning=true"));
+    }
+
+    #[test]
+    fn join_basic() {
+        assert_eq!(
+            cmp(
+                "users.parquet",
+                "join \"orders.parquet\" on .user_id | select .a.email, .b.amount",
+                20
+            ),
+            "SELECT a.email, b.amount FROM read_parquet('users.parquet') AS a \
+             INNER JOIN read_parquet('orders.parquet') AS b ON a.user_id = b.user_id"
+        );
+    }
+
+    #[test]
+    fn join_with_filter_and_limit() {
+        let s = cmp(
+            "users.parquet",
+            "join \"orders.parquet\" on .user_id | where .b.amount > 100 | top 5 by .b.amount",
+            20,
+        );
+        assert!(
+            s.contains("INNER JOIN read_parquet('orders.parquet') AS b ON a.user_id = b.user_id")
+        );
+        assert!(s.contains("WHERE b.amount > 100"));
+        assert!(s.contains("ORDER BY b.amount DESC"));
+        assert!(s.contains("LIMIT 5"));
+    }
+
+    #[test]
+    fn join_right_side_hive_autodetect() {
+        let s = cmp(
+            "users.parquet",
+            "join \"orders/dt=2026-*/*.parquet\" on .user_id",
+            20,
+        );
+        // Right side is a hive-partitioned glob — should auto-enable hive_partitioning.
+        assert!(
+            s.contains("read_parquet('orders/dt=2026-*/*.parquet', hive_partitioning=true) AS b")
+        );
+    }
+
+    #[test]
+    fn join_explicit_different_column_names() {
+        // users.id = orders.user_id — different col names on each side.
+        assert_eq!(
+            cmp(
+                "users.parquet",
+                "join \"orders.parquet\" on .a.id == .b.user_id | select .a.email, .b.amount",
+                20
+            ),
+            "SELECT a.email, b.amount FROM read_parquet('users.parquet') AS a \
+             INNER JOIN read_parquet('orders.parquet') AS b ON a.id = b.user_id"
+        );
+    }
+
+    #[test]
+    fn join_double_alias_columns_in_projection() {
+        // `.a.col` should preserve the dot so both alias and column survive the rewrite.
+        let s = cmp(
+            "u.parquet",
+            "join \"o.parquet\" on .id | .a.email, .b.amount",
+            20,
+        );
+        assert!(s.contains("SELECT a.email, b.amount"));
     }
 
     #[test]

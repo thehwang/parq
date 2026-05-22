@@ -1,0 +1,95 @@
+name: Release
+
+# Triggered by pushing a tag like v0.2.0 / v1.0.0-rc1 etc.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # to create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: pq-aarch64-apple-darwin.tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: pq-x86_64-apple-darwin.tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: pq-x86_64-unknown-linux-musl.tar.gz
+            # musl needs the cross-compiler toolchain
+            apt_deps: musl-tools
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install apt deps (Linux)
+        if: matrix.apt_deps != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_deps }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cd target/${{ matrix.target }}/release
+          # Strip and tarball — keeps assets ~10 MB instead of ~30 MB.
+          strip pq || true
+          tar -czf "../../../dist/${{ matrix.artifact }}" pq
+          cd -
+          # Generate a sha256 sidecar for users who care about supply chain.
+          (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected assets
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
