@@ -44,7 +44,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Terminal;
 use tui_textarea::TextArea;
 
@@ -232,6 +234,10 @@ struct App<'ta> {
     focus: Panel,
     /// True when `:` is pressed → expands the compiled-SQL panel.
     show_sql: bool,
+    /// True when `?` is pressed → renders a centred help overlay over the
+    /// 4-panel layout. Any subsequent key dismisses it (so `?` then start
+    /// typing in Query feels natural).
+    show_help: bool,
     /// Last edited query text — cached so we don't re-run on focus changes.
     last_compiled: String,
     /// Set when query was edited but we're throttling SQL execution.
@@ -273,6 +279,7 @@ impl<'ta> App<'ta> {
             preview,
             focus: Panel::Columns,
             show_sql: false,
+            show_help: false,
             last_compiled: String::new(),
             pending_compile_at: None,
             flash: None,
@@ -354,6 +361,34 @@ impl<'ta> App<'ta> {
         self.schedule_compile();
     }
 
+    /// Append the current column to the projection. Unlike `toggle_*`, this
+    /// is purely additive — Enter on a column that's already projected is a
+    /// no-op (rather than removing it). Useful when you're building up a
+    /// `.a, .b, .c` shape and don't want to accidentally delete things.
+    fn append_current_column(&mut self) {
+        let Some(idx) = self.column_state.selected() else {
+            return;
+        };
+        let Some(col) = self.columns.get(idx) else {
+            return;
+        };
+        if col.selected {
+            self.flash_msg(format!(".{} already in projection", col.name));
+            return;
+        }
+        let token = format!(".{}", col.name);
+        let cur = self.current_query_text();
+        let new_q = if cur.trim().is_empty() {
+            token
+        } else if cur.trim_start().starts_with('.') {
+            format!("{cur}, {token}")
+        } else {
+            format!("{token} | {cur}")
+        };
+        self.replace_query(new_q);
+        self.schedule_compile();
+    }
+
     fn replace_query(&mut self, text: String) {
         let mut new_ta = TextArea::default();
         new_ta.insert_str(&text);
@@ -383,9 +418,17 @@ impl<'ta> App<'ta> {
 // ─── Event handling ──────────────────────────────────────────────────────────
 
 fn on_key(app: &mut App<'_>, key: KeyEvent) {
-    // Global keys (work in any panel).
+    // Ctrl-C always quits, regardless of any modal state.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
+        return;
+    }
+    // Help overlay is modal: any key dismisses it. We swallow the keypress
+    // (don't pass it through to the panel below) so users can press `?` to
+    // peek and another arbitrary key to dismiss without surprise side
+    // effects (e.g. accidentally toggling a column).
+    if app.show_help {
+        app.show_help = false;
         return;
     }
     if key.code == KeyCode::Tab {
@@ -416,7 +459,8 @@ fn on_key_columns(app: &mut App<'_>, key: KeyEvent) {
         }
         KeyCode::Char('Y') => app.copy_cli_to_clipboard(),
         KeyCode::Char(':') => app.show_sql = !app.show_sql,
-        KeyCode::Char('?') => app.flash_msg("? help — coming in v0.6"),
+        KeyCode::Char('?') => app.show_help = true,
+        KeyCode::Enter => app.append_current_column(),
         KeyCode::Down | KeyCode::Char('j') => {
             let len = app.columns.len();
             if len == 0 {
@@ -470,6 +514,7 @@ fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
         }
         KeyCode::Char('Y') => app.copy_cli_to_clipboard(),
         KeyCode::Char(':') => app.show_sql = !app.show_sql,
+        KeyCode::Char('?') => app.show_help = true,
         // Arrow keys: scroll the data table in v0.6 (currently shows top 50).
         _ => {}
     }
@@ -488,7 +533,17 @@ fn render(f: &mut ratatui::Frame, app: &mut App<'_>) {
         .constraints([Constraint::Length(28), Constraint::Min(40)])
         .split(outer[0]);
 
-    render_columns(f, app, body[0]);
+    // Left column: Columns (top, takes most of it) + Filters (bottom 7 rows).
+    // Filters is a *display-only* panel for now — it shows where/having
+    // clauses extracted from the current query so users can see at a glance
+    // which filters are active, even when their query has folded into a
+    // single line. Editing happens in the Query panel.
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(7)])
+        .split(body[0]);
+    render_columns(f, app, left[0]);
+    render_filters(f, app, left[1]);
 
     let right_constraints = if app.show_sql {
         vec![
@@ -513,6 +568,11 @@ fn render(f: &mut ratatui::Frame, app: &mut App<'_>) {
     }
 
     render_status_bar(f, app, outer[1]);
+
+    // Help overlay rendered last so it sits on top of every panel.
+    if app.show_help {
+        render_help(f, f.area());
+    }
 }
 
 fn focused_style(active: bool) -> Style {
@@ -683,12 +743,13 @@ fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
         .iter()
         .map(|r| {
             Row::new(r.iter().enumerate().map(|(i, c)| {
+                let w = col_widths[i] as usize;
+                let truncated = ellipsise(c, w);
                 let text = if numeric.get(i).copied().unwrap_or(false) {
-                    // Right-align inside the column by left-padding to col width.
-                    let w = col_widths[i] as usize;
-                    format!("{:>w$}", c, w = w)
+                    // Right-align numerics by padding on the left to col width.
+                    format!("{:>w$}", truncated, w = w)
                 } else {
-                    c.clone()
+                    truncated
                 };
                 Cell::from(text)
             }))
@@ -710,6 +771,22 @@ fn display_width(s: &str) -> usize {
     s.chars().count()
 }
 
+/// Truncate `s` to fit in `max_chars` columns, replacing the last char with
+/// `…` so users can tell at a glance that the cell was clipped (vs. a value
+/// that happens to look short). No-op when the value already fits.
+fn ellipsise(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
 fn looks_numeric(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -727,13 +804,219 @@ fn looks_numeric(s: &str) -> bool {
 }
 
 fn render_status_bar(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
-    let default_help = " Tab next │ ␣ toggle col │ Q exit+print │ Esc/q quit │ : SQL │ ? help ";
+    let default_help =
+        " Tab next │ ␣ toggle col │ ⏎ append │ Q exit+print │ Esc/q quit │ : SQL │ ? help ";
     let text = match &app.flash {
         Some((msg, _)) => msg.clone(),
         None => default_help.to_string(),
     };
     let p = Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(p, area);
+}
+
+fn render_filters(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
+    let filters = extract_filters(&app.last_compiled);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(format!(" Filters · {} ", filters.len()));
+
+    if filters.is_empty() {
+        let p = Paragraph::new(Span::styled(
+            "(none — type `where .col == …` in Query)",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .block(block);
+        f.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = filters
+        .into_iter()
+        .map(|f| {
+            ListItem::new(Line::from(vec![
+                Span::styled("• ", Style::default().fg(Color::Yellow)),
+                Span::raw(f),
+            ]))
+        })
+        .collect();
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
+/// Extract `where … | …` and `having …` stages from a pq DSL query string,
+/// for the read-only Filters panel. Lossy by design — we don't try to
+/// reconstruct the full parser; just pull each filter expression out with
+/// enough fidelity that users see what conditions are active.
+fn extract_filters(q: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for stage in q.split('|').map(str::trim) {
+        if stage.is_empty() {
+            continue;
+        }
+        for kw in &["where ", "having "] {
+            if let Some(pos) = find_word(stage, kw.trim_end()) {
+                let expr = stage[pos + kw.len()..].trim().to_string();
+                if !expr.is_empty() {
+                    let prefix = if *kw == "having " { "(having) " } else { "" };
+                    out.push(format!("{prefix}{expr}"));
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Word-bounded, case-insensitive substring find. Returns the byte offset
+/// at which `needle` appears in `haystack`, requiring whitespace (or start
+/// of string) immediately before. Avoids matching `whereabouts` as `where`.
+fn find_word(haystack: &str, needle: &str) -> Option<usize> {
+    let lower = haystack.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut start = 0usize;
+    while let Some(rel) = lower[start..].find(&needle_lower) {
+        let abs = start + rel;
+        let prev_ok = abs == 0 || lower.as_bytes()[abs - 1].is_ascii_whitespace();
+        let after = abs + needle_lower.len();
+        let after_ok = after >= lower.len() || lower.as_bytes()[after].is_ascii_whitespace();
+        if prev_ok && after_ok {
+            return Some(abs);
+        }
+        start = abs + 1;
+    }
+    None
+}
+
+fn render_help(f: &mut ratatui::Frame, full: Rect) {
+    let area = centered_rect(78, 80, full);
+    f.render_widget(Clear, area);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let key = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled("pq tui — keys", bold)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Tab / Shift-Tab", key),
+            Span::raw("    cycle focus (Columns ↔ Query ↔ Data)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc / q", key),
+            Span::raw("              quit (one Esc inside Query unfocuses first)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Q", key),
+            Span::raw("                    quit + print equivalent pq CLI to stdout"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Y", key),
+            Span::raw("                    flash equivalent CLI in status bar"),
+        ]),
+        Line::from(vec![
+            Span::styled("  :", key),
+            Span::raw("                    toggle compiled-SQL panel"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ?", key),
+            Span::raw("                    this help (any key dismisses)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl-C", key),
+            Span::raw("               force quit (works through any modal)"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Columns panel", bold)),
+        Line::from(vec![
+            Span::styled("  ↑ ↓ / k j", key),
+            Span::raw("            move cursor"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Space", key),
+            Span::raw("                toggle column in projection"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter", key),
+            Span::raw("                append column to projection (no toggle off)"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Query panel — DSL grammar quick ref", bold)),
+        Line::from(Span::styled(
+            "  stages joined by `|`; auto WHERE/HAVING routing",
+            dim,
+        )),
+        Line::from(""),
+        Line::from(Span::raw(
+            "  .col, .col2                           — projection",
+        )),
+        Line::from(Span::raw(
+            "  where .a > 18                         — filter",
+        )),
+        Line::from(Span::raw(
+            "  group_by .country | count             — count per group",
+        )),
+        Line::from(Span::raw(
+            "  group_by .c | sum .rev                — sum per group",
+        )),
+        Line::from(Span::raw(
+            "  top 10 by sum_rev                     — order desc + limit",
+        )),
+        Line::from(Span::raw(
+            "  sort by .rev desc | limit 5           — explicit",
+        )),
+        Line::from(Span::raw(
+            "  distinct                              — SELECT DISTINCT",
+        )),
+        Line::from(Span::raw(
+            "  join \"b.parquet\" on .id              — INNER join",
+        )),
+        Line::from(Span::raw(
+            "  left_join \"b\" on .a.id == .b.uid     — LEFT/RIGHT/FULL",
+        )),
+        Line::from(Span::raw(
+            "  to_csv  /  to_json                    — line per row",
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Full grammar: https://github.com/thehwang/parq#grammar",
+            dim,
+        )),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" ? help — press any key to dismiss "),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// Compute a centered subrect that's `pct_x`% wide and `pct_y`% tall of the
+/// outer area. Standard ratatui idiom — kept inline because it's small.
+fn centered_rect(pct_x: u16, pct_y: u16, outer: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(outer);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1]
 }
 
 // ─── Main entry ──────────────────────────────────────────────────────────────
@@ -854,5 +1137,66 @@ mod tests {
     #[test]
     fn shell_quote_empty() {
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn ellipsise_fits_unchanged() {
+        assert_eq!(ellipsise("alice", 5), "alice");
+        assert_eq!(ellipsise("alice", 10), "alice");
+    }
+
+    #[test]
+    fn ellipsise_clipped_with_marker() {
+        assert_eq!(ellipsise("alice@example.com", 8), "alice@e…");
+        assert_eq!(ellipsise("alice@example.com", 1), "…");
+    }
+
+    #[test]
+    fn ellipsise_zero_width() {
+        assert_eq!(ellipsise("anything", 0), "");
+    }
+
+    #[test]
+    fn extract_filters_empty_query() {
+        assert!(extract_filters("").is_empty());
+        assert!(extract_filters(".email").is_empty());
+    }
+
+    #[test]
+    fn extract_filters_single_where_stage() {
+        let f = extract_filters("where .age > 18");
+        assert_eq!(f, vec![".age > 18"]);
+    }
+
+    #[test]
+    fn extract_filters_inline_where_in_projection() {
+        // v0 inline shorthand: `.email where .country == "US"`
+        let f = extract_filters(".email where .country == \"US\"");
+        assert_eq!(f, vec![".country == \"US\""]);
+    }
+
+    #[test]
+    fn extract_filters_multiple_pipe_stages() {
+        let f = extract_filters("where .a > 0 | group_by .c | having count > 5");
+        assert_eq!(f, vec![".a > 0", "(having) count > 5"]);
+    }
+
+    #[test]
+    fn extract_filters_word_boundary_avoids_whereabouts() {
+        // Bare-word "whereabouts" must not match `where` — find_word's
+        // after_ok check ensures we only match on whitespace/end after.
+        assert!(extract_filters(".whereabouts").is_empty());
+    }
+
+    #[test]
+    fn looks_numeric_basic() {
+        assert!(looks_numeric("42"));
+        assert!(looks_numeric("3.14"));
+        assert!(looks_numeric("-1.5e10"));
+        assert!(looks_numeric("1,234"));
+        assert!(!looks_numeric("US"));
+        assert!(!looks_numeric(""));
+        // No digit at all → not numeric, even if all chars are punctuation.
+        assert!(!looks_numeric("--"));
     }
 }
