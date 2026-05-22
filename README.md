@@ -126,19 +126,19 @@ no need to drop into the DuckDB CLI to `CREATE SECRET`:
 
 | env vars                                              | creates                                |
 |-------------------------------------------------------|----------------------------------------|
-| `PQ_GCS_HMAC_KEY` + `PQ_GCS_HMAC_SECRET`              | GCS HMAC secret (recommended)          |
-| `PQ_GCS_BEARER_TOKEN`                                 | GCS bearer-token secret (best-effort)  |
+| `PQ_GCS_BEARER_TOKEN`                                 | GCS OAuth secret — recommended for interactive use |
+| `PQ_GCS_HMAC_KEY` + `PQ_GCS_HMAC_SECRET`              | GCS HMAC secret — long-lived, for cron / batch     |
 | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`         | S3 secret (also reads `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL_S3`) |
 
 ```bash
-# GCS — HMAC (long-lived, cron-friendly)
+# GCS — OAuth (interactive, easiest; token refreshes ~hourly via gcloud)
+export PQ_GCS_BEARER_TOKEN=$(gcloud auth print-access-token)
+pq schema gs://bucket/file.parquet
+
+# GCS — HMAC (long-lived, cron-friendly, no expiry)
 export PQ_GCS_HMAC_KEY='GOOG1XXXXXX...'    # from `gcloud storage hmac create`
 export PQ_GCS_HMAC_SECRET='...'
 pq gs://bucket/file.parquet '.email'
-
-# GCS — short-lived OAuth token (re-export every ~1 hour)
-export PQ_GCS_BEARER_TOKEN=$(gcloud auth print-access-token)
-pq schema gs://bucket/file.parquet
 
 # S3-compatible (works with MinIO / R2 / GCS-S3-mode via AWS_ENDPOINT_URL_S3)
 export AWS_ACCESS_KEY_ID=AKIA…
@@ -147,6 +147,18 @@ pq s3://my-bucket/file.parquet | head
 
 # Globs (quote them so the shell doesn't expand first)
 pq 'data/dt=2026-*/*.parquet' 'group_by .dt | count'
+```
+
+**Auto-refresh trick** — drop in your `~/.zshrc` so every new shell gets a
+fresh token without thinking about it:
+
+```bash
+pq() {
+  if [[ -z "$PQ_GCS_BEARER_TOKEN" ]] && command -v gcloud >/dev/null 2>&1; then
+    export PQ_GCS_BEARER_TOKEN=$(gcloud auth print-access-token 2>/dev/null)
+  fi
+  command pq "$@"
+}
 ```
 
 Set `PQ_DEBUG=1` to see which secret got registered (otherwise pq stays
