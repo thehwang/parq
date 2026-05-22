@@ -50,7 +50,7 @@ jobs:
 
       - name: Install cross (musl only)
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross --rev 99b8069c14ff14fb6e8bcc1a1b3e3df9239c2a85
+        run: cargo install cross --locked --version 0.2.5
 
       - name: Build release binary (cargo)
         if: matrix.use_cross != true
