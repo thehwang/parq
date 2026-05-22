@@ -55,6 +55,12 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const PREVIEW_LIMIT: usize = 50;
 const SQL_THROTTLE: Duration = Duration::from_millis(50);
 
+/// Ghost-text shown in the empty Query panel so first-time users see what
+/// the DSL accepts. tui-textarea hides it on the first keystroke. Kept
+/// short — full grammar lives in `?` help (v0.6) and the README.
+const QUERY_PLACEHOLDER: &str =
+    "try: '.email, .country where .country == \"US\"' or 'group_by .country | count'";
+
 // ─── Panels ──────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -248,6 +254,12 @@ impl<'ta> App<'ta> {
 
         let mut query = TextArea::default();
         query.set_block(Block::default().borders(Borders::ALL).title(" Query "));
+        // Show a dim ghost-line as placeholder. tui-textarea draws it only
+        // while the buffer is empty; first keystroke removes it. The hint
+        // surfaces the most common DSL shape so first-time users have
+        // something to delete-and-replace instead of staring at a blank.
+        query.set_placeholder_text(QUERY_PLACEHOLDER);
+        query.set_placeholder_style(Style::default().fg(Color::DarkGray));
         // Default: show first 20 rows (same as bare `pq file.parquet`).
         // We leave the textarea empty, which compile_plan() expands into
         // `SELECT * FROM ... LIMIT 20`.
