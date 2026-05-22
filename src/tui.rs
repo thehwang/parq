@@ -406,7 +406,10 @@ fn on_key(app: &mut App<'_>, key: KeyEvent) {
 
 fn on_key_columns(app: &mut App<'_>, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
+        // Esc anywhere outside the Query panel is "I'm done, leave". One Esc
+        // from inside Query goes back to Columns first; then a second Esc
+        // exits — vim/lazygit/ranger pattern.
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('Q') => {
             app.should_quit = true;
             app.print_cli_on_exit = true;
@@ -460,7 +463,7 @@ fn on_key_query(app: &mut App<'_>, key: KeyEvent) {
 
 fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('Q') => {
             app.should_quit = true;
             app.print_cli_on_exit = true;
@@ -569,6 +572,25 @@ fn render_query(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
             .border_style(focused_style(active))
             .title(title),
     );
+    // Cursor styling reflects focus. tui-textarea draws the cursor itself
+    // (we never call f.set_cursor_position) — without an explicit style the
+    // default REVERSED modifier collapses to invisible against the
+    // placeholder's DarkGray fg, which is the bug we hit.
+    if active {
+        app.query.set_cursor_style(
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
+        app.query
+            .set_cursor_line_style(Style::default().bg(Color::Rgb(40, 40, 40)));
+    } else {
+        // Unfocused: hide the cursor entirely so it's not stealing
+        // attention from whatever panel the user is actually driving.
+        app.query.set_cursor_style(Style::default());
+        app.query.set_cursor_line_style(Style::default());
+    }
     f.render_widget(&app.query, area);
 }
 
@@ -705,7 +727,7 @@ fn looks_numeric(s: &str) -> bool {
 }
 
 fn render_status_bar(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
-    let default_help = " Tab next │ ␣ toggle col │ Y copy CLI │ Q exit+print │ : SQL │ ? help ";
+    let default_help = " Tab next │ ␣ toggle col │ Q exit+print │ Esc/q quit │ : SQL │ ? help ";
     let text = match &app.flash {
         Some((msg, _)) => msg.clone(),
         None => default_help.to_string(),
