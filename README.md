@@ -6,6 +6,8 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
+> **New in v0.5:** `pq tui FILE` — interactive lazygit-style 4-panel browser with live preview, editable DSL, and equivalent-CLI export on quit. See [Interactive TUI](#interactive-tui-pq-tui-file) below.
+
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
 ┌─────────┬─────────────┐
@@ -116,7 +118,47 @@ pq sample  users.parquet -n 10
 pq head    users.parquet -n 5
 pq tail    users.parquet -n 5
 pq count   users.parquet
+pq tui     users.parquet     # interactive 4-panel browser (see below)
 ```
+
+### Interactive TUI (`pq tui FILE`)
+
+Lazygit-style 4-panel browser for exploring a parquet file without leaving
+the terminal:
+
+```
+┌─ Columns · 5 ──────────┐ ┌─ Query · 2 ms ──────────────────────────┐
+│ ✓ id        BIGINT     │ │ group_by .country | sum .revenue        │
+│ ✓ email     VARCHAR    │ │                                         │
+│ ✓ country   VARCHAR    │ └─────────────────────────────────────────┘
+│ ▶ revenue   DOUBLE     │ ┌─ Data · 7 of 7 rows shown ─────────────┐
+│   age       BIGINT     │ │ country │ sum_revenue                  │
+│                        │ │ US      │ 19065.00                     │
+└────────────────────────┘ │ FR      │   999.99                     │
+┌─ Filters · 1 ──────────┐ │ DE      │   312.00                     │
+│ • .country == "US"     │ │ ...                                    │
+└────────────────────────┘ └────────────────────────────────────────┘
+ Tab next │ ␣ toggle col │ ⏎ append │ Q exit+print │ Esc/q quit │ : SQL │ ?
+```
+
+The Query panel is the source of truth: edit your DSL there, watch the
+Data panel re-run live (50 ms throttle), peek at compiled SQL with `:`,
+and exit with `Q` to dump the equivalent `pq` CLI one-liner to stdout
+— so the TUI doubles as a query builder for your shell history.
+
+Keys at a glance (full list inside the TUI via `?`):
+
+| key | what it does |
+|---|---|
+| `Tab` / `Shift-Tab` | cycle focus across panels |
+| `↑↓` / `j k` | move cursor (Columns panel) |
+| `Space` | toggle column in projection |
+| `Enter` | append column to projection (no toggle off) |
+| `:` | toggle compiled-SQL panel |
+| `?` | open help overlay (any key dismisses) |
+| `Q` | quit + print equivalent CLI |
+| `Esc` / `q` | quit; one Esc inside Query unfocuses first |
+| `Ctrl-C` | force quit through any modal |
 
 ### Cloud paths, globs, hive auto-discovery
 
