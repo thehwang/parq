@@ -591,26 +591,105 @@ fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
         return;
     }
 
-    let header = Row::new(
-        app.preview
-            .headers
-            .iter()
-            .map(|h| Cell::from(h.clone()).style(Style::default().add_modifier(Modifier::BOLD))),
-    );
+    // Column widths: max(header, max cell), capped at 40. Anything longer just
+    // gets ellipsised by the cell renderer — we'd rather see all columns than
+    // dedicate the whole viewport to one wide string. v0.6: horizontal scroll.
+    const MIN_W: u16 = 4;
+    const MAX_W: u16 = 40;
+    let ncols = app.preview.headers.len();
+    let mut col_widths: Vec<u16> = app
+        .preview
+        .headers
+        .iter()
+        .map(|h| (display_width(h) as u16).clamp(MIN_W, MAX_W))
+        .collect();
+    for row in &app.preview.rows {
+        for (i, cell) in row.iter().enumerate().take(ncols) {
+            let w = display_width(cell) as u16;
+            col_widths[i] = col_widths[i].max(w.min(MAX_W));
+        }
+    }
+
+    // Heuristic numeric detection — right-align if every non-empty value in
+    // the column parses as a number-ish thing (digits, ., -, +, e, E, ,, ∅).
+    let numeric: Vec<bool> = (0..ncols)
+        .map(|i| {
+            let mut any = false;
+            for r in &app.preview.rows {
+                if let Some(s) = r.get(i) {
+                    if s.is_empty() || s == "∅" {
+                        continue;
+                    }
+                    any = true;
+                    if !looks_numeric(s) {
+                        return false;
+                    }
+                }
+            }
+            any
+        })
+        .collect();
+
+    let header = Row::new(app.preview.headers.iter().enumerate().map(|(i, h)| {
+        let mut style = Style::default().add_modifier(Modifier::BOLD);
+        if numeric[i] {
+            style = style.fg(Color::Cyan);
+        }
+        let cell = Cell::from(h.clone()).style(style);
+        if numeric[i] {
+            cell.style(style)
+        } else {
+            cell
+        }
+    }));
+
     let rows: Vec<Row> = app
         .preview
         .rows
         .iter()
-        .map(|r| Row::new(r.iter().map(|c| Cell::from(c.clone()))))
+        .map(|r| {
+            Row::new(r.iter().enumerate().map(|(i, c)| {
+                let text = if numeric.get(i).copied().unwrap_or(false) {
+                    // Right-align inside the column by left-padding to col width.
+                    let w = col_widths[i] as usize;
+                    format!("{:>w$}", c, w = w)
+                } else {
+                    c.clone()
+                };
+                Cell::from(text)
+            }))
+        })
         .collect();
-    let widths: Vec<Constraint> = app
-        .preview
-        .headers
-        .iter()
-        .map(|_| Constraint::Min(8))
-        .collect();
-    let table = Table::new(rows, widths).header(header).block(block);
+
+    let widths: Vec<Constraint> = col_widths.iter().map(|w| Constraint::Length(*w)).collect();
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
     f.render_widget(table, area);
+}
+
+/// Display width — counts chars, not bytes. Cheap stand-in for unicode-width;
+/// good enough for ASCII / common text. Wide CJK glyphs will under-count by
+/// up to half, but the MAX_W cap stops anything from being unreadable.
+fn display_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn looks_numeric(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let mut seen_digit = false;
+    for c in t.chars() {
+        match c {
+            '0'..='9' => seen_digit = true,
+            '.' | '-' | '+' | ',' | 'e' | 'E' | '_' => {}
+            _ => return false,
+        }
+    }
+    seen_digit
 }
 
 fn render_status_bar(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
