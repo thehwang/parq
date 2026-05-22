@@ -24,20 +24,21 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: pq-aarch64-apple-darwin.tar.gz
+            use_cross: false
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: pq-x86_64-apple-darwin.tar.gz
+            use_cross: false
+          # musl statically links libc → single binary that runs on every Linux.
+          # DuckDB's bundled C++ build needs a real C++ cross-toolchain, which
+          # ubuntu's musl-tools doesn't provide; cross-rs ships one in a Docker
+          # image, so we use it for this target only.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: pq-x86_64-unknown-linux-musl.tar.gz
-            # musl needs the cross-compiler toolchain
-            apt_deps: musl-tools
+            use_cross: true
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install apt deps (Linux)
-        if: matrix.apt_deps != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_deps }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,8 +48,17 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Install cross (musl only)
+        if: matrix.use_cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 99b8069c14ff14fb6e8bcc1a1b3e3df9239c2a85
+
+      - name: Build release binary (cargo)
+        if: matrix.use_cross != true
         run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }} --locked
 
       - name: Package
         run: |
@@ -58,7 +68,7 @@ jobs:
           strip pq || true
           tar -czf "../../../dist/${{ matrix.artifact }}" pq
           cd -
-          # Generate a sha256 sidecar for users who care about supply chain.
+          # SHA256 sidecar for users who care about supply chain integrity.
           (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
           ls -la dist/
 
