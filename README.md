@@ -323,7 +323,16 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.4** (current)
+**v0.5** (current)
+- [x] `pq tui FILE` — interactive 4-panel browser (Columns / Filters / editable Query / live Data)
+- [x] Editable DSL panel as the source of truth, throttled live preview (50 ms)
+- [x] Ghost-text placeholder, visible block cursor when focused, `Esc/q` quits
+- [x] `Space` toggles a column, `Enter` appends, `?` opens full help overlay
+- [x] Compiled SQL hidden behind `:` (DSL-first, SQL on demand)
+- [x] Auto-loads `httpfs` + creates DuckDB secrets from env vars: `PQ_GCS_BEARER_TOKEN`, `PQ_GCS_HMAC_*`, `AWS_*` — no more `duckdb -c CREATE SECRET` dance
+- [x] Numeric columns right-align with cyan headers; long values get `…` truncation marker
+
+**v0.4**
 - [x] LEFT / RIGHT / FULL OUTER joins (alongside INNER)
 - [x] Multi-key joins: `'join "b" on .a.x == .b.x and .a.y == .b.y'`
 - [x] `to_csv` / `to_json` line-output stages — raw line per row, no headers
@@ -348,22 +357,20 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's coming
 
-**v0.5 — interactive TUI + cloud creds (in progress on `v0.5-tui` branch)**
-- [x] Auto-load httpfs at startup (no more manual `INSTALL httpfs; LOAD httpfs;`)
-- [x] Auto-create cloud secrets from env: `PQ_GCS_HMAC_*`, `PQ_GCS_BEARER_TOKEN`, `AWS_*`
-- [ ] `pq tui file.parquet` — 4-panel browser: Columns / Filters / editable Query / live Data preview
-- [ ] Editable DSL panel as the source of truth (two-way bound to side-panel actions)
-- [ ] Live preview re-runs on each keystroke (DuckDB sub-ms)
-- [ ] `Y` to copy the equivalent CLI one-liner; `q` to exit and print it on stdout
-- [ ] Compiled SQL hidden behind `:` (DSL-first, SQL on demand)
-
-**v0.6+**
+**v0.6 — TUI depth pass**
 - [ ] Semantic cursor sync — column lineage highlighting across all panels
-- [ ] Explain panel with `EXPLAIN ANALYZE` + heuristic suggestions (zonemap pruning, projection PD, etc.)
-- [ ] Drill-down: enter on aggregate cell → auto-generates `where` for underlying rows
+- [ ] `Y` truly copies to clipboard (arboard with feature flag for headless builds)
+- [ ] Horizontal scroll in Data panel for long-string columns
+- [ ] Real-time row count (currently shows "preview rows", not full count)
+- [ ] `Filters` panel becomes interactive (drop a filter with `d`, edit with `e`)
+- [ ] Explain panel with `EXPLAIN ANALYZE` + heuristic hints (zonemap pruning, projection PD)
+- [ ] Drill-down: Enter on an aggregate cell → auto-generates `where` for underlying rows
+- [ ] DuckDB GCS `credential_chain` ADC support once duckdb#22413 lands
+
+**v0.7+**
+- [ ] Query history with branching (every keystroke a frame, rewindable)
 - [ ] Schema diff between two parquet files
 - [ ] Multi-file tabs with visual join builder
-- [ ] Query history with branching (every keystroke is a frame; rewindable)
 
 ## Limitations (v0)
 

@@ -6,7 +6,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/thehwang/parq/main/install.sh | bash
 #
 # Override target:                                PQ_INSTALL_DIR=/usr/local/bin sh install.sh
-# Pin a specific version (default = latest):      PQ_VERSION=v0.4.0 sh install.sh
+# Pin a specific version (default = latest):      PQ_VERSION=v0.5.0 sh install.sh
 
 set -eu
 
