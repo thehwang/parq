@@ -120,14 +120,37 @@ pq count   users.parquet
 
 ### Cloud paths, globs, hive auto-discovery
 
-DuckDB's `read_parquet` handles all of these natively:
+DuckDB's `read_parquet` handles all of these natively. pq auto-loads the
+`httpfs` extension and reads cloud credentials from environment variables —
+no need to drop into the DuckDB CLI to `CREATE SECRET`:
+
+| env vars                                              | creates                                |
+|-------------------------------------------------------|----------------------------------------|
+| `PQ_GCS_HMAC_KEY` + `PQ_GCS_HMAC_SECRET`              | GCS HMAC secret (recommended)          |
+| `PQ_GCS_BEARER_TOKEN`                                 | GCS bearer-token secret (best-effort)  |
+| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`         | S3 secret (also reads `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL_S3`) |
 
 ```bash
+# GCS — HMAC (long-lived, cron-friendly)
+export PQ_GCS_HMAC_KEY='GOOG1XXXXXX...'    # from `gcloud storage hmac create`
+export PQ_GCS_HMAC_SECRET='...'
 pq gs://bucket/file.parquet '.email'
+
+# GCS — short-lived OAuth token (re-export every ~1 hour)
+export PQ_GCS_BEARER_TOKEN=$(gcloud auth print-access-token)
+pq schema gs://bucket/file.parquet
+
+# S3-compatible (works with MinIO / R2 / GCS-S3-mode via AWS_ENDPOINT_URL_S3)
+export AWS_ACCESS_KEY_ID=AKIA…
+export AWS_SECRET_ACCESS_KEY=…
+pq s3://my-bucket/file.parquet | head
 
 # Globs (quote them so the shell doesn't expand first)
 pq 'data/dt=2026-*/*.parquet' 'group_by .dt | count'
 ```
+
+Set `PQ_DEBUG=1` to see which secret got registered (otherwise pq stays
+quiet — credential noise has no place on stdout).
 
 **Hive partitioning auto-detects.** Any path containing a `key=value` segment
 turns the partition keys into normal columns you can group/filter on:
@@ -313,7 +336,9 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's coming
 
-**v0.5 — interactive TUI (lazygit-style)**
+**v0.5 — interactive TUI + cloud creds (in progress on `v0.5-tui` branch)**
+- [x] Auto-load httpfs at startup (no more manual `INSTALL httpfs; LOAD httpfs;`)
+- [x] Auto-create cloud secrets from env: `PQ_GCS_HMAC_*`, `PQ_GCS_BEARER_TOKEN`, `AWS_*`
 - [ ] `pq tui file.parquet` — 4-panel browser: Columns / Filters / editable Query / live Data preview
 - [ ] Editable DSL panel as the source of truth (two-way bound to side-panel actions)
 - [ ] Live preview re-runs on each keystroke (DuckDB sub-ms)

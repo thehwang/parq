@@ -27,8 +27,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use duckdb::Connection;
 
+mod cloud;
 mod output;
 mod parser;
+mod tui;
 
 use crate::output::OutputFormat;
 use crate::parser::compile_plan;
@@ -107,6 +109,10 @@ enum Cmd {
     },
     /// Total row count.
     Count { file: String },
+    /// Interactive TUI: 4-panel browser (Columns / Filters / editable Query / live Data).
+    /// On exit, prints the equivalent `pq` CLI one-liner so you can copy it
+    /// into a shell history, Makefile, or cron job. (v0.5 MVP)
+    Tui { file: String },
 }
 
 fn main() -> Result<()> {
@@ -212,10 +218,24 @@ fn open_conn() -> Result<Connection> {
         LOAD httpfs;
         ",
     );
+    // Auto-inject any cloud creds visible in the env (PQ_GCS_HMAC_*, AWS_*).
+    // Failures are silent unless PQ_DEBUG=1 — we never block local-file usage
+    // because someone has stale env vars sitting around.
+    cloud::inject_credentials(&conn);
     Ok(conn)
 }
 
 fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat) -> Result<()> {
+    // The TUI takes over the terminal — handle it before we build any SQL.
+    if let Cmd::Tui { file } = cmd {
+        // Hand the TUI its own connection so it owns the duckdb session.
+        // Cheap (in-memory db, ~50 ms) and cleaner than threading a borrow
+        // through ratatui's event-loop closures.
+        let tui_conn = open_conn()?;
+        let _ = conn; // explicit acknowledgement that we don't reuse `conn`
+        return tui::run(tui_conn, file.clone());
+    }
+
     let sql = match cmd {
         Cmd::Schema { file } => format!(
             "SELECT column_name, column_type, \"null\" AS nullable \
@@ -250,6 +270,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat) -> Result<()>
             "SELECT count(*) AS rows FROM {src}",
             src = parser::source_clause(file)
         ),
+        Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
     };
 
     output::run_and_print(conn, &sql, fmt)

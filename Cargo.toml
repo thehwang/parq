@@ -22,6 +22,11 @@ anyhow = "1.0"
 serde_json = "1.0"
 comfy-table = "7.1"
 colored = "2.1"
+# tui-textarea 0.7 is built against ratatui 0.29 / crossterm 0.28 — keep these
+# pinned together until tui-textarea ships a ratatui 0.30 release.
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
 
 [profile.release]
 opt-level = 3
