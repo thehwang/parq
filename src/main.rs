@@ -31,7 +31,7 @@ mod output;
 mod parser;
 
 use crate::output::OutputFormat;
-use crate::parser::compile;
+use crate::parser::compile_plan;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -71,6 +71,12 @@ struct Cli {
     #[arg(short = 'w', long, value_name = "SECS")]
     watch: Option<u64>,
 
+    /// Register a DuckDB SQL macro before running the query. Repeatable.
+    /// Format: `name(args) := body` (the `:=` is rewritten to SQL `AS`).
+    /// Example: `--udf 'is_us(c) := c = ''US'''`
+    #[arg(long = "udf", value_name = "MACRO")]
+    udfs: Vec<String>,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -106,6 +112,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let conn = open_conn()?;
+    register_udfs(&conn, &cli.udfs)?;
     let fmt = OutputFormat::resolve(&cli.output);
 
     // Watch mode wraps execution in a loop with an ANSI screen-clear before each tick.
@@ -150,14 +157,49 @@ fn run_query(cli: &Cli, conn: &Connection, fmt: OutputFormat) -> Result<()> {
     } else {
         cli.n
     };
-    let sql = compile(file, query, effective_n)?;
+    let plan = compile_plan(file, query, effective_n)?;
 
     if cli.explain {
-        println!("{}", sql);
+        println!("{}", plan.sql);
         return Ok(());
     }
 
-    output::run_and_print(conn, &sql, fmt)
+    // `to_csv` / `to_json` stages override the user's `-o` choice — the whole
+    // point of those stages is "I want raw lines on stdout".
+    let effective_fmt = if plan.raw_lines {
+        OutputFormat::RawLines
+    } else {
+        fmt
+    };
+    output::run_and_print(conn, &plan.sql, effective_fmt)
+}
+
+/// Register user-supplied SQL macros on the connection before any queries run.
+///
+/// Accepted forms (per --udf flag):
+///   `name(args) := body`         — pq sugar; we rewrite `:=` to ` AS `
+///   `name(args) AS body`         — DuckDB native; passed through verbatim
+///   anything else                — wrapped as `CREATE MACRO <input>` and
+///                                  whatever DuckDB makes of it is the error.
+fn register_udfs(conn: &Connection, udfs: &[String]) -> Result<()> {
+    for raw in udfs {
+        let body = raw.trim();
+        // Tolerate users wrapping their macro body in `CREATE MACRO ...` or not.
+        let normalized = if body.to_ascii_lowercase().starts_with("create ") {
+            body.to_string()
+        } else if let Some(idx) = body.find(":=") {
+            format!(
+                "CREATE OR REPLACE MACRO {} AS {}",
+                body[..idx].trim(),
+                body[idx + 2..].trim()
+            )
+        } else {
+            format!("CREATE OR REPLACE MACRO {body}")
+        };
+        conn.execute_batch(&normalized)
+            .with_context(|| format!("failed to register --udf: {raw}"))?;
+    }
+    Ok(())
 }
 
 fn open_conn() -> Result<Connection> {

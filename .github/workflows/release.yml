@@ -25,10 +25,12 @@ jobs:
             os: macos-latest
             artifact: pq-aarch64-apple-darwin.tar.gz
             use_cross: false
+            ext: ""
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: pq-x86_64-apple-darwin.tar.gz
             use_cross: false
+            ext: ""
           # musl statically links libc → single binary that runs on every Linux.
           # DuckDB's bundled C++ build needs a real C++ cross-toolchain, which
           # ubuntu's musl-tools doesn't provide; cross-rs ships one in a Docker
@@ -37,6 +39,14 @@ jobs:
             os: ubuntu-latest
             artifact: pq-x86_64-unknown-linux-musl.tar.gz
             use_cross: true
+            ext: ""
+          # Windows: native MSVC toolchain on the windows-latest runner. We
+          # ship a .zip (Windows users expect that) and a .exe binary.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: pq-x86_64-pc-windows-msvc.zip
+            use_cross: false
+            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
 
@@ -60,7 +70,9 @@ jobs:
         if: matrix.use_cross == true
         run: cross build --release --target ${{ matrix.target }} --locked
 
-      - name: Package
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           mkdir -p dist
           cd target/${{ matrix.target }}/release
@@ -71,6 +83,17 @@ jobs:
           # SHA256 sidecar for users who care about supply chain integrity.
           (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
           ls -la dist/
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $bin = "target\${{ matrix.target }}\release\pq.exe"
+          Compress-Archive -Path $bin -DestinationPath "dist\${{ matrix.artifact }}" -Force
+          $hash = (Get-FileHash "dist\${{ matrix.artifact }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}" | Out-File -Encoding ASCII "dist\${{ matrix.artifact }}.sha256"
+          Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
         with:

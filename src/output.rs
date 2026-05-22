@@ -14,6 +14,10 @@ pub enum OutputFormat {
     Ndjson,
     Csv,
     Parquet,
+    /// One row per line, single TEXT column printed as-is. Used when a query
+    /// ends in `to_csv` / `to_json` — the renderer doesn't add quoting,
+    /// headers, or JSON wrapping; what DuckDB returns is what stdout gets.
+    RawLines,
 }
 
 impl OutputFormat {
@@ -75,8 +79,27 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
         OutputFormat::Json => print_json(&column_names, &collected),
         OutputFormat::Ndjson => print_ndjson(&column_names, &collected),
         OutputFormat::Csv => print_csv(&column_names, &collected),
+        OutputFormat::RawLines => print_raw_lines(&collected),
         OutputFormat::Parquet => unreachable!("Parquet handled before row iteration"),
     }
+}
+
+/// Print one row per line, taking the first column's value verbatim.
+/// The query is expected to have collapsed every selected col into a single
+/// TEXT column (via `to_csv` / `to_json`), so we only ever read column 0.
+fn print_raw_lines(rows: &[Vec<Value>]) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for r in rows {
+        // value_to_display already turns NULL → "∅"; for raw-lines we want
+        // empty string instead so awk/jq pipelines don't see junk.
+        let line = match r.first() {
+            Some(Value::Null) | None => String::new(),
+            Some(v) => value_to_display(v),
+        };
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
 }
 
 /// Write the query result as a parquet file to stdout.

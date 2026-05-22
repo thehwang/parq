@@ -37,19 +37,30 @@ The current options for ad-hoc parquet querying are all painful:
 ## Install
 
 ```bash
-# Prebuilt binary — macOS arm64 / x86_64 / Linux musl
-# (replace the asset name to match your platform; SHA256 sidecars are next to each archive)
-curl -L https://github.com/thehwang/parq/releases/latest/download/pq-aarch64-apple-darwin.tar.gz \
+# One-liner (auto-detects macOS arm64/x86_64 + Linux musl, installs to ~/.local/bin)
+curl -fsSL https://raw.githubusercontent.com/thehwang/parq/main/install.sh | bash
+
+# Homebrew
+brew install thehwang/parq/pq
+
+# Prebuilt binary, manual (replace asset name for your platform)
+curl -fsSL https://github.com/thehwang/parq/releases/latest/download/pq-aarch64-apple-darwin.tar.gz \
   | tar xz && sudo mv pq /usr/local/bin/
 
-# from source
+# Windows: download .zip from the Releases page
+#   https://github.com/thehwang/parq/releases/latest
+
+# From source
 cargo install pq
 
-# build from this repo
+# Build from this repo
 git clone https://github.com/thehwang/parq && cd parq
-cargo build --release
-./target/release/pq --help
+cargo build --release && ./target/release/pq --help
 ```
+
+Available prebuilt assets per release: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-musl` (works on every Linux), `x86_64-pc-windows-msvc` (.zip).
+Each tarball/zip ships with a `.sha256` sidecar.
 
 ## Quickstart
 
@@ -93,6 +104,8 @@ pq events.parquet 'group_by .country | count | sum .duration | avg .duration'
 | `sort by .col [asc\|desc]` | `sort by .revenue desc` | `ORDER BY revenue DESC` |
 | `limit N` / `head N` | `limit 5` | `LIMIT 5` |
 | `distinct` | `distinct` | `SELECT DISTINCT` |
+| `[inner\|left\|right\|full]_join "f" on …` | `left_join "o.parquet" on .id` | `LEFT OUTER JOIN read_parquet('o.parquet') AS b …` |
+| `to_csv` / `to_json` | `.email, .country \| to_csv` | wraps in `concat_ws(',', …)` / `to_json({…})` |
 
 ### Subcommands
 
@@ -126,19 +139,67 @@ pq 'sales/dt=*/region=*/*.parquet' 'group_by .dt, .region | count | sum .amount'
 
 ### Joins
 
-Single equi-join, two shapes — bare `.col` for matching column names, explicit
-`.a.x == .b.y` otherwise. Left side is `a`, right side is `b`:
+INNER (default), LEFT / RIGHT / FULL OUTER — pick the verb that matches what
+you'd write in SQL. Left side is `a`, right side is `b` (referenced as
+`.a.col` / `.b.col` in subsequent stages):
 
 ```bash
-# Same column name on both sides
+# INNER (shorthand: same column name on both sides)
 pq orders.parquet 'join "users.parquet" on .user_id | select .a.amount, .b.email'
 
-# Different column names (users.id ↔ orders.user_id)
+# Explicit ON expression — different column names per side
 pq users.parquet 'join "orders.parquet" on .a.id == .b.user_id \
-                  | group_by .a.country | count | sum .b.amount | sort by .sum_b_amount desc'
+                  | group_by .a.country | sum .b.amount | sort by .sum_b_amount desc'
+
+# LEFT OUTER — keep all users, even ones with no orders (b.* is ∅)
+pq users.parquet 'left_join "orders.parquet" on .a.id == .b.user_id \
+                  | select .a.email, .b.amount, .b.status'
+
+# Multi-key — just compose with `and`
+pq users.parquet 'inner_join "events.parquet" \
+                    on .a.id == .b.user_id and .a.dt == .b.dt | count'
 ```
 
-The right side also supports cloud URIs and hive auto-discovery.
+`right_join` and `full_join` (alias `outer_join`) work identically. The right
+side supports cloud URIs and hive auto-discovery the same as the left.
+
+### Line output: `to_csv` / `to_json`
+
+Two stages that fold each row into a single TEXT line. No headers, no quoting,
+no JSON wrapping — what stdout sees is what `awk` / `jq` / `xsv` consume:
+
+```bash
+# Raw CSV per row, no header
+pq users.parquet '.email, .country, .revenue | to_csv'
+# alice@example.com,US,1245.0
+# bob@example.com,CA,89.5
+# …
+
+# JSON object per row (stable field names — even after group_by/agg)
+pq users.parquet 'group_by .country | sum .revenue | to_json' \
+  | jq -r 'select(.sum_revenue > 1000) | .country'
+
+# `to_json` with no projection dumps the whole row as a struct
+pq users.parquet 'where .age > 18 | to_json' | jq .
+```
+
+Internally these wrap your pipeline in a subquery so `sort by` / `limit`
+upstream still work as expected.
+
+### `--udf`: register DuckDB SQL macros
+
+Define helpers once, reuse across stages. Repeatable. The `:=` is rewritten
+to DuckDB's `CREATE OR REPLACE MACRO ... AS ...` automatically:
+
+```bash
+pq sample.parquet \
+  --udf $'is_us(c) := c = \'US\'' \
+  --udf 'discount(x) := x * 0.9' \
+  '.email, discount(.revenue) AS d where is_us(.country) | sort by .d desc'
+```
+
+For one-off needs you can also just call DuckDB's built-ins directly inside
+`where` / `select` — `regexp_matches`, `list_contains`, `to_timestamp`, etc.
 
 ### Watch mode
 
@@ -227,11 +288,20 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.3** (current)
+**v0.4** (current)
+- [x] LEFT / RIGHT / FULL OUTER joins (alongside INNER)
+- [x] Multi-key joins: `'join "b" on .a.x == .b.x and .a.y == .b.y'`
+- [x] `to_csv` / `to_json` line-output stages — raw line per row, no headers
+- [x] `--udf` flag — register DuckDB SQL macros before the query runs
+- [x] Windows binary (`x86_64-pc-windows-msvc.zip`) on every release
+- [x] Homebrew tap: `brew install thehwang/parq/pq`
+- [x] One-line installer: `curl -fsSL …/install.sh | bash`
+
+**v0.3**
 - [x] Hive partitioning auto-detects from `key=value` path segments — no flag needed
 - [x] Single equi-join: `'join "b.parquet" on .col'` and `'join "b.parquet" on .a.x == .b.y'`
 - [x] Watch mode: `pq -w 5 file.parquet 'count'` re-runs every N seconds
-- [x] Date32 columns now display as `YYYY-MM-DD` (not `date(days=20592)`)
+- [x] Date32 columns display as `YYYY-MM-DD`
 - [x] Prebuilt binaries on every tag — macOS arm64/x86_64 + Linux musl
 
 **v0.2**
@@ -241,13 +311,22 @@ streams large files   ✓        ✓            ✓      partial   ✓
 - [x] Output to parquet: `pq a.parquet 'where .country == "US"' -o parquet > us.parquet`
 - [x] Pipe stages with WHERE/HAVING auto-routing
 
-## What's coming (v0.4+)
+## What's coming
 
-- [ ] LEFT/RIGHT/FULL OUTER joins (currently INNER only)
-- [ ] Multi-key join: `'join "b.parquet" on .a.x == .b.x and .a.y == .b.y'`
-- [ ] `to_csv .col` / `to_json` per-row output sugar
-- [ ] Scalar UDFs: `pq f.parquet 'where regex_match(.email, "@example\\.org")'`
-- [ ] Homebrew tap (`brew install thehwang/parq/pq`)
+**v0.5 — interactive TUI (lazygit-style)**
+- [ ] `pq tui file.parquet` — 4-panel browser: Columns / Filters / editable Query / live Data preview
+- [ ] Editable DSL panel as the source of truth (two-way bound to side-panel actions)
+- [ ] Live preview re-runs on each keystroke (DuckDB sub-ms)
+- [ ] `Y` to copy the equivalent CLI one-liner; `q` to exit and print it on stdout
+- [ ] Compiled SQL hidden behind `:` (DSL-first, SQL on demand)
+
+**v0.6+**
+- [ ] Semantic cursor sync — column lineage highlighting across all panels
+- [ ] Explain panel with `EXPLAIN ANALYZE` + heuristic suggestions (zonemap pruning, projection PD, etc.)
+- [ ] Drill-down: enter on aggregate cell → auto-generates `where` for underlying rows
+- [ ] Schema diff between two parquet files
+- [ ] Multi-file tabs with visual join builder
+- [ ] Query history with branching (every keystroke is a frame; rewindable)
 
 ## Limitations (v0)
 

@@ -78,6 +78,22 @@ fn alias_safe(col: &str) -> String {
         .collect()
 }
 
+/// Given a column expression, return the name DuckDB will assign to the
+/// resulting column in a row.
+///
+/// Examples:
+///   `email`                         → `email`
+///   `a.email`                       → `email`           (table alias stripped)
+///   `sum(revenue) AS sum_revenue`   → `sum_revenue`     (AS alias wins)
+///   `lower(.email) AS lower_email`  → `lower_email`
+fn final_col_name(expr: &str) -> String {
+    let lower = expr.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind(" as ") {
+        return expr[idx + 4..].trim().to_string();
+    }
+    expr.rsplit('.').next().unwrap_or(expr).trim().to_string()
+}
+
 /// Heuristic: does the path contain at least one `name=value` directory segment?
 /// We deliberately scan just the path bytes — works for local paths, gs://, s3://.
 fn looks_like_hive_partition(path: &str) -> bool {
@@ -124,25 +140,72 @@ impl Aggregate {
             Aggregate::Max(c) => format!("max({c}) AS max_{}", alias_safe(c)),
         }
     }
+
+    /// The bare alias ("count", "sum_revenue", ...) — what the row's column will
+    /// be called once DuckDB has executed the aggregate. Used by line-output
+    /// stages to reference inner columns from the outer wrapping SELECT.
+    fn alias(&self) -> String {
+        match self {
+            Aggregate::Count => "count".into(),
+            Aggregate::CountDistinct(c) => format!("count_distinct_{}", alias_safe(c)),
+            Aggregate::Sum(c) => format!("sum_{}", alias_safe(c)),
+            Aggregate::Avg(c) => format!("avg_{}", alias_safe(c)),
+            Aggregate::Min(c) => format!("min_{}", alias_safe(c)),
+            Aggregate::Max(c) => format!("max_{}", alias_safe(c)),
+        }
+    }
+}
+
+/// SQL JOIN strength. Maps directly onto DuckDB's join keywords.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+impl JoinKind {
+    fn sql(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "INNER JOIN",
+            JoinKind::Left => "LEFT OUTER JOIN",
+            JoinKind::Right => "RIGHT OUTER JOIN",
+            JoinKind::Full => "FULL OUTER JOIN",
+        }
+    }
 }
 
 /// Single equi-join. Reference left/right sides as `.a.col` / `.b.col` in
 /// subsequent stages.
 ///
 /// `on_expr` is a complete SQL ON clause body (e.g. `a.id = b.user_id`), already
-/// rewritten from the user's DSL form. Supports two input shapes:
-///   `on .col`               ─ shorthand for `a.col = b.col`
-///   `on .a.id == .b.user_id` ─ explicit (must contain `=` or `==`)
+/// rewritten from the user's DSL form. Three input shapes (parsed in this order):
+///   `on .col`                            ─ shorthand for `a.col = b.col`
+///   `on .a.id == .b.user_id`             ─ single key, explicit (must contain `=`)
+///   `on .a.x == .b.x and .a.y == .b.y`   ─ multi-key (just compose with `and`/`AND`)
 #[derive(Debug, Clone)]
 pub struct Join {
+    pub kind: JoinKind,
     pub right_source: String,
     pub on_expr: String,
+}
+
+/// Per-row line output. Folds the projection list down to a single TEXT column
+/// that the renderer prints raw, one row per line — no quoting, no header.
+/// Useful when piping into `jq`, `awk`, `xsv`, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineFormat {
+    /// `concat_ws(',', col1::TEXT, col2::TEXT, ...)` — minimal CSV (no quoting).
+    Csv,
+    /// `to_json({col1: col1, col2: col2, ...})` — DuckDB's struct-to-JSON.
+    Json,
 }
 
 #[derive(Debug, Default)]
 pub struct QueryPlan {
     pub source: String,           // "read_parquet('...')"
-    pub join: Option<Join>,       // a single INNER JOIN (left = `a`, right = `b`)
+    pub join: Option<Join>,       // single equi-join (left = `a`, right = `b`)
     pub projections: Vec<String>, // explicit SELECT columns (non-aggregate)
     pub aggregates: Vec<Aggregate>,
     pub filters: Vec<String>, // WHERE
@@ -151,6 +214,18 @@ pub struct QueryPlan {
     pub order_by: Vec<(String, bool)>, // (col_or_expr, ascending)
     pub limit: Option<usize>,
     pub distinct: bool,
+    /// When set, fold the SELECT list into a single TEXT column and switch the
+    /// output format to raw-lines (one line per row, no header).
+    pub line_format: Option<LineFormat>,
+}
+
+/// The compile() output. We return more than just SQL because some stages
+/// (`to_csv`, `to_json`) need to flag the renderer to emit raw lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileOutput {
+    pub sql: String,
+    /// True iff the query produces a single TEXT column meant to be printed as-is.
+    pub raw_lines: bool,
 }
 
 impl QueryPlan {
@@ -165,6 +240,7 @@ impl QueryPlan {
         !self.aggregates.is_empty() || !self.group_by.is_empty()
     }
 
+    /// What ends up after SELECT, BEFORE any line_format wrapping.
     fn select_list(&self) -> String {
         if self.has_grouping() {
             let mut parts: Vec<String> = self.group_by.clone();
@@ -183,7 +259,38 @@ impl QueryPlan {
         }
     }
 
+    /// Final column NAMES (i.e. how rows are addressed *after* the inner SELECT
+    /// runs). Used by line-output wrapping to build the outer column refs.
+    /// Returns an empty Vec if the projection is `*` — caller decides whether
+    /// that's an error or means "all columns".
+    fn final_column_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.has_grouping() {
+            for g in &self.group_by {
+                out.push(final_col_name(g));
+            }
+            for a in &self.aggregates {
+                out.push(a.alias());
+            }
+        } else if !self.projections.is_empty() {
+            for p in &self.projections {
+                out.push(final_col_name(p));
+            }
+        }
+        out
+    }
+
     pub fn to_sql(&self) -> String {
+        let core = self.to_sql_core();
+        match self.line_format {
+            None => core,
+            Some(fmt) => self.wrap_for_line_output(core, fmt),
+        }
+    }
+
+    /// SQL for the underlying data pipeline (projections, joins, filters,
+    /// grouping, ordering, limit) — without any line-format wrapping.
+    fn to_sql_core(&self) -> String {
         let mut sql = String::with_capacity(128);
         sql.push_str("SELECT ");
         if self.distinct {
@@ -193,9 +300,11 @@ impl QueryPlan {
         sql.push_str(" FROM ");
         sql.push_str(&self.source);
 
-        // INNER JOIN (single, equi-join, aliases left=a / right=b).
+        // Join (INNER/LEFT/RIGHT/FULL OUTER), single equi-condition, aliases left=a / right=b.
         if let Some(j) = &self.join {
-            sql.push_str(" AS a INNER JOIN ");
+            sql.push_str(" AS a ");
+            sql.push_str(j.kind.sql());
+            sql.push(' ');
             sql.push_str(&j.right_source);
             sql.push_str(" AS b ON ");
             sql.push_str(&j.on_expr);
@@ -227,35 +336,75 @@ impl QueryPlan {
         }
         sql
     }
+
+    /// Wrap the inner pipeline in an outer SELECT that collapses each row to a
+    /// single TEXT column (`line`). Done as a subquery so that ORDER BY in the
+    /// inner can still reference aliases / aggregates that we no longer
+    /// surface from the outer SELECT.
+    fn wrap_for_line_output(&self, inner_sql: String, fmt: LineFormat) -> String {
+        let cols = self.final_column_names();
+        let collapse = match (fmt, cols.is_empty()) {
+            // No explicit projections + JSON → struct-of-row via DuckDB's
+            // struct_pack on the table alias.
+            (LineFormat::Json, true) => "to_json(__pq_inner) AS line".to_string(),
+            // No explicit projections + CSV → can't enumerate columns at
+            // compile time. Emit invalid SQL (`<NULL>`) so DuckDB's error
+            // message tells the user what's wrong; the alternative would be
+            // to make to_sql() fallible just for this edge case.
+            (LineFormat::Csv, true) => {
+                "/* to_csv requires an explicit projection (e.g. .col1, .col2 | to_csv) */ NULL AS line".to_string()
+            }
+            (LineFormat::Csv, false) => {
+                let casts: Vec<String> = cols.iter().map(|c| format!("{c}::TEXT")).collect();
+                format!("concat_ws(',', {}) AS line", casts.join(", "))
+            }
+            (LineFormat::Json, false) => {
+                let pairs: Vec<String> = cols.iter().map(|c| format!("\"{c}\": {c}")).collect();
+                format!("to_json({{{}}}) AS line", pairs.join(", "))
+            }
+        };
+        format!("SELECT {collapse} FROM ({inner_sql}) AS __pq_inner")
+    }
 }
 
-// ─── compile() ───────────────────────────────────────────────────────────────
+// ─── compile_plan() ──────────────────────────────────────────────────────────
 
-pub fn compile(file: &str, query: &str, default_limit: usize) -> Result<String> {
+/// Compile a pq DSL query to DuckDB SQL plus a "raw lines" hint flag for the
+/// renderer. Returns `CompileOutput { sql, raw_lines }`.
+pub fn compile_plan(file: &str, query: &str, default_limit: usize) -> Result<CompileOutput> {
     let src = source_clause(file);
     let q = query.trim();
 
-    // Empty query → head with default limit
     if q.is_empty() {
         let limit = if default_limit == 0 {
             String::new()
         } else {
             format!(" LIMIT {default_limit}")
         };
-        return Ok(format!("SELECT * FROM {src}{limit}"));
+        return Ok(CompileOutput {
+            sql: format!("SELECT * FROM {src}{limit}"),
+            raw_lines: false,
+        });
     }
 
-    // Raw SQL passthrough (escape hatch). FILE token is substituted with our source clause.
+    // Raw SQL passthrough (escape hatch). FILE → read_parquet('...').
     let lower_first = q.chars().take(8).collect::<String>().to_ascii_lowercase();
     if lower_first.starts_with("select ") || lower_first.starts_with("with ") {
-        return Ok(q.replace("FILE", &src));
+        return Ok(CompileOutput {
+            sql: q.replace("FILE", &src),
+            raw_lines: false,
+        });
     }
 
     let mut plan = QueryPlan::new(src);
     for stage in split_pipe_stages(q) {
         parse_stage(stage, &mut plan)?;
     }
-    Ok(plan.to_sql())
+    let raw_lines = plan.line_format.is_some();
+    Ok(CompileOutput {
+        sql: plan.to_sql(),
+        raw_lines,
+    })
 }
 
 // ─── pipe-stage parsing ──────────────────────────────────────────────────────
@@ -375,28 +524,65 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
         return Ok(());
     }
 
-    // join "PATH" on .col   →   INNER JOIN read_parquet('PATH') AS b ON a.col = b.col
-    // After a join, columns are referenced as `.a.col` / `.b.col` in subsequent stages.
-    if let Some(rest) = strip_keyword(s, "join") {
+    // Joins.
+    //   `join` / `inner_join`              → INNER JOIN
+    //   `left_join`  / `left join`         → LEFT OUTER JOIN
+    //   `right_join` / `right join`        → RIGHT OUTER JOIN
+    //   `full_join`  / `full join` /
+    //   `outer_join` / `outer join`        → FULL OUTER JOIN
+    //
+    // ON-clause shapes (auto-detected by presence of `=`):
+    //   `on .col`                          → a.col = b.col
+    //   `on .a.x == .b.y`                  → a.x = b.y
+    //   `on .a.x == .b.x and .a.y == .b.y` → a.x = b.x AND a.y = b.y     (multi-key)
+    //
+    // Match the more-specific verbs first; `join` is a strict prefix that would
+    // otherwise capture e.g. `join_filter` (we still use strip_keyword which
+    // requires a whitespace boundary, so the order is defensive only).
+    let join_match: Option<(JoinKind, &str)> =
+        if let Some(r) = strip_keyword(s, "left_join").or_else(|| strip_keyword(s, "left join")) {
+            Some((JoinKind::Left, r))
+        } else if let Some(r) =
+            strip_keyword(s, "right_join").or_else(|| strip_keyword(s, "right join"))
+        {
+            Some((JoinKind::Right, r))
+        } else if let Some(r) = strip_keyword(s, "full_join")
+            .or_else(|| strip_keyword(s, "full join"))
+            .or_else(|| strip_keyword(s, "outer_join"))
+            .or_else(|| strip_keyword(s, "outer join"))
+        {
+            Some((JoinKind::Full, r))
+        } else if let Some(r) = strip_keyword(s, "inner_join")
+            .or_else(|| strip_keyword(s, "inner join"))
+            .or_else(|| strip_keyword(s, "join"))
+        {
+            Some((JoinKind::Inner, r))
+        } else {
+            None
+        };
+
+    if let Some((kind, rest)) = join_match {
         if plan.join.is_some() {
             return Err(anyhow!(
-                "multiple joins are not supported yet (v0.3); fall back to raw SQL via SELECT/WITH for chained joins"
+                "multiple joins are not supported yet; fall back to raw SQL via SELECT/WITH for chained joins"
             ));
         }
         let (path_raw, on_part) = rest.split_once(" on ").ok_or_else(|| {
-            anyhow!("`join` needs `on .col`: `join \"file.parquet\" on .user_id`")
+            anyhow!(
+                "`{} ...` needs `on .col`: `{} \"file.parquet\" on .user_id`",
+                kind.sql(),
+                kind.sql()
+            )
         })?;
         let path = path_raw.trim().trim_matches('"').trim_matches('\'').trim();
         if path.is_empty() {
             return Err(anyhow!("`join` needs a quoted file path"));
         }
-        // source_clause() handles cloud URIs + hive auto-detection on the right side.
         let right_source = source_clause(path);
-
-        // Two on-clause shapes:
-        //   `on .col`              → a.col = b.col       (shorthand for matching col names)
-        //   `on .a.x == .b.y`      → a.x = b.y           (any expression containing '=')
         let on_expr = if on_part.contains('=') {
+            // Multi-key `and` chains pass through unchanged because rewrite_filter
+            // only touches comparison operators / quotes / dot-prefixes; `and`/`AND`
+            // are valid SQL keywords already.
             let rewritten = rewrite_filter(on_part);
             let trimmed = rewritten.trim().to_string();
             if trimmed.is_empty() {
@@ -411,9 +597,22 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
             format!("a.{col} = b.{col}")
         };
         plan.join = Some(Join {
+            kind,
             right_source,
             on_expr,
         });
+        return Ok(());
+    }
+
+    // Per-row line output stages: bare `to_csv` / `to_json` (no args).
+    // These must be the LAST stage in a query — anything after is silently
+    // ignored (well, parsed but the SELECT list collapse happens regardless).
+    if lower == "to_csv" || lower == "tocsv" {
+        plan.line_format = Some(LineFormat::Csv);
+        return Ok(());
+    }
+    if lower == "to_json" || lower == "tojson" {
+        plan.line_format = Some(LineFormat::Json);
         return Ok(());
     }
 
@@ -631,7 +830,7 @@ mod tests {
     use super::*;
 
     fn cmp(file: &str, q: &str, n: usize) -> String {
-        compile(file, q, n).unwrap()
+        compile_plan(file, q, n).unwrap().sql
     }
 
     // ── v0 backward-compat ──────────────────────────────────────────────────
@@ -914,6 +1113,127 @@ mod tests {
         // Right side is a hive-partitioned glob — should auto-enable hive_partitioning.
         assert!(
             s.contains("read_parquet('orders/dt=2026-*/*.parquet', hive_partitioning=true) AS b")
+        );
+    }
+
+    #[test]
+    fn join_left_outer() {
+        let s = cmp(
+            "users.parquet",
+            "left_join \"orders.parquet\" on .user_id | select .a.email, .b.amount",
+            20,
+        );
+        assert!(s.contains(
+            "LEFT OUTER JOIN read_parquet('orders.parquet') AS b ON a.user_id = b.user_id"
+        ));
+        assert!(s.contains("SELECT a.email, b.amount"));
+    }
+
+    #[test]
+    fn join_right_outer_space_form() {
+        let s = cmp("a.parquet", "right join \"b.parquet\" on .id | count", 20);
+        assert!(s.contains("RIGHT OUTER JOIN"));
+    }
+
+    #[test]
+    fn join_full_outer() {
+        let s = cmp("a.parquet", "full_join \"b.parquet\" on .id", 20);
+        assert!(s.contains("FULL OUTER JOIN"));
+    }
+
+    #[test]
+    fn join_outer_alias_for_full() {
+        let s = cmp("a.parquet", "outer_join \"b.parquet\" on .id", 20);
+        assert!(s.contains("FULL OUTER JOIN"));
+    }
+
+    #[test]
+    fn join_inner_explicit() {
+        let s = cmp("a.parquet", "inner_join \"b.parquet\" on .id", 20);
+        assert!(s.contains("INNER JOIN"));
+        // Sanity: no LEFT/RIGHT/FULL leaked in.
+        assert!(!s.contains("OUTER JOIN"));
+    }
+
+    #[test]
+    fn join_multi_key_via_and() {
+        let s = cmp(
+            "users.parquet",
+            "left_join \"events.parquet\" on .a.id == .b.user_id and .a.dt == .b.dt | count",
+            20,
+        );
+        assert!(
+            s.contains("ON a.id = b.user_id and a.dt = b.dt"),
+            "expected multi-key ON expression, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn to_csv_bare_emits_concat_ws() {
+        let s = cmp("u.parquet", ".email, .country | to_csv", 20);
+        // Outer SELECT references the inner subquery's final column names.
+        assert!(
+            s.contains("SELECT concat_ws(',', email::TEXT, country::TEXT) AS line FROM (SELECT email, country"),
+            "got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn to_csv_marks_raw_lines_in_compile_output() {
+        let out = compile_plan("u.parquet", ".email, .country | to_csv", 20).unwrap();
+        assert!(out.raw_lines);
+    }
+
+    #[test]
+    fn to_json_uses_final_column_names() {
+        // After a join, the inner subquery exposes columns named `email` and
+        // `amount` (DuckDB strips the table alias). The outer struct keys
+        // and values both reference those final names — NOT the raw `a.email` /
+        // `b.amount` expressions.
+        let s = cmp(
+            "u.parquet",
+            "join \"o.parquet\" on .id | select .a.email, .b.amount | to_json",
+            20,
+        );
+        assert!(
+            s.contains("to_json({\"email\": email, \"amount\": amount}) AS line FROM ("),
+            "got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn to_json_after_group_by_with_order() {
+        // The bug that motivated the subquery wrap: `ORDER BY sum_revenue DESC`
+        // can't run alongside a SELECT that's been folded to a single `line`
+        // column. Wrapping fixes it because ORDER BY now lives in the inner
+        // SELECT where the alias is in scope.
+        let s = cmp(
+            "s.parquet",
+            "group_by .country | sum .revenue | sort by .sum_revenue desc | to_json",
+            20,
+        );
+        assert!(
+            s.contains(
+                "to_json({\"country\": country, \"sum_revenue\": sum_revenue}) AS line FROM ("
+            ),
+            "got: {}",
+            s
+        );
+        assert!(s.contains("ORDER BY sum_revenue DESC"));
+    }
+
+    #[test]
+    fn to_json_without_explicit_columns_uses_struct_pack() {
+        // Bare `to_json` (no projection) → output a JSON object of the entire
+        // row by passing the table alias through DuckDB's struct-of-row coercion.
+        let s = cmp("u.parquet", "to_json", 0);
+        assert!(
+            s.contains("SELECT to_json(__pq_inner) AS line FROM ("),
+            "got: {}",
+            s
         );
     }
 
