@@ -11,6 +11,8 @@ readme = "README.md"
 keywords = ["parquet", "cli", "jq", "duckdb", "data"]
 categories = ["command-line-utilities", "database"]
 
+build = "build.rs"
+
 [[bin]]
 name = "pq"
 path = "src/main.rs"
