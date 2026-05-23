@@ -20,6 +20,12 @@
 //! │ AWS_SESSION_TOKEN  (optional)  │   URL_STYLE) — same vars boto3 reads. │
 //! │ AWS_REGION / AWS_DEFAULT_REGION│                                       │
 //! │ AWS_ENDPOINT_URL_S3            │                                       │
+//! ├────────────────────────────────┼───────────────────────────────────────┤
+//! │ (none of the above)            │ TYPE S3, PROVIDER credential_chain    │
+//! │                                │   — auto-resolves AWS_PROFILE,        │
+//! │                                │   ~/.aws/credentials, SSO, EC2 IMDS,  │
+//! │                                │   ECS task role. Same chain boto3     │
+//! │                                │   walks.                              │
 //! └────────────────────────────────┴───────────────────────────────────────┘
 //!
 //! Errors here are deliberately swallowed (warned to stderr if PQ_DEBUG=1).
@@ -108,18 +114,27 @@ fn install_gcs_bearer(conn: &Connection) {
 }
 
 fn install_s3(conn: &Connection) {
-    let key = match env::var("AWS_ACCESS_KEY_ID") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
-    let secret = match env::var("AWS_SECRET_ACCESS_KEY") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            warn("AWS_ACCESS_KEY_ID set without AWS_SECRET_ACCESS_KEY — skipping S3 secret");
-            return;
-        }
-    };
+    let key = env::var("AWS_ACCESS_KEY_ID").ok().filter(|s| !s.is_empty());
+    let secret = env::var("AWS_SECRET_ACCESS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
 
+    match (key, secret) {
+        (Some(k), Some(s)) => install_s3_explicit(conn, k, s),
+        (Some(_), None) => {
+            warn("AWS_ACCESS_KEY_ID set without AWS_SECRET_ACCESS_KEY — skipping S3 secret");
+        }
+        (None, Some(_)) => {
+            warn("AWS_SECRET_ACCESS_KEY set without AWS_ACCESS_KEY_ID — skipping S3 secret");
+        }
+        // No explicit creds → fall back to DuckDB's credential_chain provider,
+        // which auto-discovers ~/.aws/credentials, AWS_PROFILE, SSO, EC2 IMDS,
+        // ECS task role, etc. Same behaviour boto3 / aws-cli would use.
+        (None, None) => install_s3_credential_chain(conn),
+    }
+}
+
+fn install_s3_explicit(conn: &Connection, key: String, secret: String) {
     let mut params = vec![("KEY_ID".to_string(), key), ("SECRET".to_string(), secret)];
 
     // STS / role-chain users — boto convention.
@@ -179,6 +194,35 @@ fn install_s3(conn: &Connection) {
     } else {
         debug("registered S3 secret from AWS_* env vars");
     }
+}
+
+/// Fall back to DuckDB's S3 credential-chain provider when no explicit
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars are set. This
+/// chains through, in order:
+///
+///   1. AWS SDK env vars  (already none if we're here, but cheap to recheck)
+///   2. Shared credentials file  (`~/.aws/credentials`, honoring `AWS_PROFILE`)
+///   3. SSO  (`aws sso login` cached tokens)
+///   4. EC2 instance metadata service  (IMDS — lets cron jobs pick up the
+///      box's IAM role automatically)
+///   5. ECS / Fargate task role  (container metadata service)
+///
+/// We always create the secret — DuckDB won't actually try to resolve any of
+/// these until the first request to `s3://`, so even when the chain has
+/// nothing useful to find, this is a no-op for users who don't touch S3.
+/// On older DuckDB builds where credential_chain isn't supported, the
+/// CREATE fails silently and the user gets a clear error message later
+/// when they actually access an s3:// path.
+fn install_s3_credential_chain(conn: &Connection) {
+    let sql = "CREATE OR REPLACE SECRET pq_s3_chain (TYPE S3, PROVIDER credential_chain);";
+    if conn.execute_batch(sql).is_ok() {
+        debug(
+            "registered S3 credential_chain secret \
+             (auto-resolves AWS_PROFILE / ~/.aws / SSO / IMDS / ECS task role)",
+        );
+    }
+    // Intentionally no warn() — most users never touch S3, and a chain with
+    // nothing in it is a perfectly normal state.
 }
 
 /// SQL string-literal escape: double up single quotes. Good enough because

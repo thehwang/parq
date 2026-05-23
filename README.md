@@ -171,6 +171,7 @@ no need to drop into the DuckDB CLI to `CREATE SECRET`:
 | `PQ_GCS_BEARER_TOKEN`                                 | GCS OAuth secret — recommended for interactive use |
 | `PQ_GCS_HMAC_KEY` + `PQ_GCS_HMAC_SECRET`              | GCS HMAC secret — long-lived, for cron / batch     |
 | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`         | S3 secret (also reads `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL_S3`) |
+| _(none of the above for S3)_                          | falls back to `credential_chain` — auto-resolves `AWS_PROFILE`, `~/.aws/credentials`, SSO, EC2 IMDS, ECS task role |
 
 ```bash
 # GCS — OAuth (interactive, easiest; token refreshes ~hourly via gcloud)
@@ -182,10 +183,21 @@ export PQ_GCS_HMAC_KEY='GOOG1XXXXXX...'    # from `gcloud storage hmac create`
 export PQ_GCS_HMAC_SECRET='...'
 pq gs://bucket/file.parquet '.email'
 
-# S3-compatible (works with MinIO / R2 / GCS-S3-mode via AWS_ENDPOINT_URL_S3)
+# S3 — explicit env vars
 export AWS_ACCESS_KEY_ID=AKIA…
 export AWS_SECRET_ACCESS_KEY=…
 pq s3://my-bucket/file.parquet | head
+
+# S3 — named profile from ~/.aws/credentials (no env vars needed)
+export AWS_PROFILE=cadent-prod
+pq schema s3://my-bucket/file.parquet
+
+# S3 — SSO  (works once `aws sso login` cached a token)
+aws sso login --profile=cadent-sso
+AWS_PROFILE=cadent-sso pq schema s3://my-bucket/file.parquet
+
+# S3 — IAM role on EC2 / ECS  (no creds anywhere — chain pulls from IMDS / task role)
+pq s3://my-bucket/file.parquet
 
 # Globs (quote them so the shell doesn't expand first)
 pq 'data/dt=2026-*/*.parquet' 'group_by .dt | count'
@@ -365,7 +377,11 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.5** (current)
+**v0.5.1** (current)
+- [x] S3 `credential_chain` fallback — `AWS_PROFILE`, `~/.aws/credentials`, SSO,
+      EC2 IMDS, and ECS task role now Just Work without setting `AWS_ACCESS_KEY_ID`
+
+**v0.5**
 - [x] `pq tui FILE` — interactive 4-panel browser (Columns / Filters / editable Query / live Data)
 - [x] Editable DSL panel as the source of truth, throttled live preview (50 ms)
 - [x] Ghost-text placeholder, visible block cursor when focused, `Esc/q` quits
