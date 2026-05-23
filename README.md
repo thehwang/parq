@@ -6,7 +6,9 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.5:** `pq tui FILE` — interactive lazygit-style 4-panel browser with live preview, editable DSL, and equivalent-CLI export on quit. See [Interactive TUI](#interactive-tui-pq-tui-file) below.
+> **New in v0.6:** the TUI just grew teeth. Cursor on `sum_revenue` highlights the source `revenue` in the Columns panel (semantic sync); typing `.c` pops up a schema completion menu; `Enter` on any Data row drills down by adding a `where` clause; press `e` for an Explain panel with predicate/projection-pushdown facts and 💡 actionable suggestions. See [Interactive TUI](#interactive-tui-pq-tui-file) below.
+>
+> _v0.5 added `pq tui FILE` — interactive lazygit-style 4-panel browser with live preview, editable DSL, and equivalent-CLI export on quit._
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -146,15 +148,38 @@ Data panel re-run live (50 ms throttle), peek at compiled SQL with `:`,
 and exit with `Q` to dump the equivalent `pq` CLI one-liner to stdout
 — so the TUI doubles as a query builder for your shell history.
 
+#### v0.6 super-powers
+
+- **Semantic sync.** Park your cursor on `sum_revenue` in the Query panel
+  and `★ revenue` lights up gold in the Columns panel. Move the Data
+  panel cursor onto a column header — same trick, source field highlights
+  back in Columns. Lineage is forgiving: works on partial / mid-typing
+  queries too.
+- **Schema completion.** Type `.c` in the Query panel and a popup of
+  matching columns appears (prefix wins; substring matches still shown).
+  `Tab` / `↑↓` to cycle, `Enter` to accept, `Esc` to dismiss.
+- **Drill-down.** Run `group_by .country | count`, focus the Data panel,
+  arrow down to the `US` row, hit `Enter` — the Query panel grows a
+  `where .country == "US"` clause and re-runs. `Backspace` undoes the
+  drill if you went too deep.
+- **Explain panel (`e`).** Pops a band under Data showing how DuckDB
+  plans your query: scans, predicate pushdown, projection pushdown, and
+  💡 heuristic hints when something obvious is missing —
+  e.g. `💡 add 'where .dt = …' to prune partitions` if your path has
+  hive segments but the query doesn't reference them.
+
 Keys at a glance (full list inside the TUI via `?`):
 
 | key | what it does |
 |---|---|
 | `Tab` / `Shift-Tab` | cycle focus across panels |
-| `↑↓` / `j k` | move cursor (Columns panel) |
-| `Space` | toggle column in projection |
-| `Enter` | append column to projection (no toggle off) |
+| `↑↓` / `j k` | move cursor (Columns / Data row) |
+| `← →` | move column cursor in Data panel (drives semantic sync) |
+| `Space` | toggle column in projection (Columns panel) |
+| `Enter` | append column / drill down on Data row / accept completion |
+| `Backspace` | undo last drill-down (Data panel) |
 | `:` | toggle compiled-SQL panel |
+| `e` | toggle Explain panel (pushdown facts + 💡 hints) |
 | `?` | open help overlay (any key dismisses) |
 | `Q` | quit + print equivalent CLI |
 | `Esc` / `q` | quit; one Esc inside Query unfocuses first |

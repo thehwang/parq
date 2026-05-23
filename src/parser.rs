@@ -388,8 +388,15 @@ pub fn compile_plan(file: &str, query: &str, default_limit: usize) -> Result<Com
     }
 
     // Raw SQL passthrough (escape hatch). FILE → read_parquet('...').
-    let lower_first = q.chars().take(8).collect::<String>().to_ascii_lowercase();
-    if lower_first.starts_with("select ") || lower_first.starts_with("with ") {
+    // We accept SELECT/WITH (the standard DML escape hatch) plus EXPLAIN/
+    // PRAGMA so users can inspect plans and tweak DuckDB session state
+    // without needing the duckdb CLI installed.
+    let lower_first = q.chars().take(10).collect::<String>().to_ascii_lowercase();
+    if lower_first.starts_with("select ")
+        || lower_first.starts_with("with ")
+        || lower_first.starts_with("explain ")
+        || lower_first.starts_with("pragma ")
+    {
         return Ok(CompileOutput {
             sql: q.replace("FILE", &src),
             raw_lines: false,
