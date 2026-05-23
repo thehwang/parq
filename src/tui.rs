@@ -260,6 +260,18 @@ struct App<'ta> {
     /// has a deterministic starting place. Used to derive `active_source`
     /// when the Data panel is focused (column header → source field).
     data_col_idx: Option<usize>,
+    /// Row-cursor inside the Data panel — paired with data_col_idx but
+    /// orthogonal: the row picks which sample to use for drill-down (Enter
+    /// in Data panel), the column drives lineage highlighting. Initialized
+    /// to None and seeded to Some(0) on the first ↑/↓ press.
+    data_row_idx: Option<usize>,
+    /// Pre-drill-down snapshot of the query buffer. Drill-down replaces the
+    /// query with `where .col == val [AND ...]`, which is irreversible
+    /// from inside tui-textarea (we rebuild the textarea, losing its
+    /// internal undo stack). Stashing the prior query here lets Backspace
+    /// in the Data panel pop the user back out — single-level undo, but
+    /// that's enough for the "drill-in / drill-out" loop analysts use.
+    drill_undo: Option<String>,
     /// In-flight schema completion. Some(_) iff the cursor is currently
     /// just after a `.prefix` pattern *and* one or more schema columns
     /// match. Rendering draws a popup; key dispatch routes Up/Down/Enter
@@ -324,6 +336,8 @@ impl<'ta> App<'ta> {
             print_cli_on_exit: false,
             lineage: Lineage::default(),
             data_col_idx: None,
+            data_row_idx: None,
+            drill_undo: None,
             completion: None,
         })
     }
@@ -352,15 +366,27 @@ impl<'ta> App<'ta> {
                 if q != self.last_compiled {
                     self.preview = run_preview(conn, &self.file, &q);
                     self.last_compiled = q.clone();
-                    // After the data refreshes, the data_col_idx may now
-                    // point past the end of the new headers (e.g. user
-                    // changed projection from 3 cols to 1). Clamp it.
+                    // After the data refreshes, both the column- and row-
+                    // cursor may now point past the end of the new
+                    // headers/rows (e.g. user changed projection from 3
+                    // cols to 1, or filter wiped the result set). Clamp
+                    // both, dropping to None when the panel is empty so
+                    // we don't render a phantom highlight.
                     if let Some(i) = self.data_col_idx {
                         if i >= self.preview.headers.len() {
                             self.data_col_idx = if self.preview.headers.is_empty() {
                                 None
                             } else {
                                 Some(self.preview.headers.len() - 1)
+                            };
+                        }
+                    }
+                    if let Some(i) = self.data_row_idx {
+                        if i >= self.preview.rows.len() {
+                            self.data_row_idx = if self.preview.rows.is_empty() {
+                                None
+                            } else {
+                                Some(self.preview.rows.len() - 1)
                             };
                         }
                     }
@@ -520,6 +546,60 @@ impl<'ta> App<'ta> {
     /// projection comma and gets in the way.
     fn refresh_completion(&mut self) {
         self.completion = compute_completion(&self.query, &self.columns);
+    }
+
+    /// Drill-down: take the currently-selected row in the Data panel and
+    /// rewrite the query to filter on its grouping-column values. Replaces
+    /// the entire query buffer (rather than appending) — the user's mental
+    /// model is "from this aggregate, show me the underlying rows", which
+    /// only makes sense without the original group_by/aggregates.
+    ///
+    /// The previous query is stashed in `drill_undo` so Backspace in the
+    /// Data panel can pop back out.
+    ///
+    /// Flashes a status message and bails when:
+    ///   - no row is selected (user pressed Enter before navigating with ↑/↓)
+    ///   - the query has no aggregate columns (no group_by → already raw rows)
+    fn drill_down(&mut self) {
+        let Some(row_idx) = self.data_row_idx else {
+            self.flash_msg("drill-down: pick a row with ↑/↓ first");
+            return;
+        };
+        let Some(row) = self.preview.rows.get(row_idx) else {
+            return;
+        };
+        let drill = match build_drill_query(&self.preview.headers, row, &self.lineage) {
+            Some(q) => q,
+            None => {
+                self.flash_msg("drill-down needs group_by — try `group_by .col | count`");
+                return;
+            }
+        };
+        let cur = self.current_query_text();
+        self.drill_undo = Some(cur);
+        self.replace_query(drill);
+        self.refresh_lineage();
+        self.refresh_completion();
+        self.schedule_compile();
+        // Reset cursors so the new (raw, ungrouped) result set isn't viewed
+        // through the lens of the prior aggregate's column highlights.
+        self.data_col_idx = None;
+        self.data_row_idx = None;
+        self.flash_msg("drilled in — Backspace to undo");
+    }
+
+    /// Pop the most recent drill-down. Single-level — successive
+    /// Backspaces are a no-op once the stash is consumed.
+    fn drill_undo(&mut self) {
+        let Some(prev) = self.drill_undo.take() else {
+            self.flash_msg("nothing to undo");
+            return;
+        };
+        self.replace_query(prev);
+        self.refresh_lineage();
+        self.refresh_completion();
+        self.schedule_compile();
+        self.flash_msg("drill-down undone");
     }
 
     /// Insert the currently-selected candidate into the query buffer,
@@ -691,7 +771,11 @@ fn on_key_query(app: &mut App<'_>, key: KeyEvent) {
 
 fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.should_quit = true,
+        // 'q' as quit only when no row-cursor is set — once the user is
+        // actively driving the row picker (typing j/k), bare `q` would be
+        // a surprising quit. They can still use Esc or Q.
+        KeyCode::Char('q') if app.data_row_idx.is_none() => app.should_quit = true,
         KeyCode::Char('Q') => {
             app.should_quit = true;
             app.print_cli_on_exit = true;
@@ -726,6 +810,34 @@ fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
                 Some(i) => i - 1,
             });
         }
+        // ── v0.6: row-cursor navigation + drill-down. ─────────────────────
+        //
+        // ↑/↓ (and j/k) seed/move the row cursor. Enter on a selected row
+        // rewrites the query into a `where` clause filtering on every
+        // grouping-column value. Backspace pops back to the pre-drill query.
+        KeyCode::Down | KeyCode::Char('j') => {
+            let n = app.preview.rows.len();
+            if n == 0 {
+                return;
+            }
+            app.data_row_idx = Some(match app.data_row_idx {
+                Some(i) if i + 1 < n => i + 1,
+                Some(i) => i,
+                None => 0,
+            });
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let n = app.preview.rows.len();
+            if n == 0 {
+                return;
+            }
+            app.data_row_idx = Some(match app.data_row_idx {
+                Some(0) | None => 0,
+                Some(i) => i - 1,
+            });
+        }
+        KeyCode::Enter => app.drill_down(),
+        KeyCode::Backspace => app.drill_undo(),
         _ => {}
     }
 }
@@ -1073,12 +1185,19 @@ fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
         Cell::from(h.clone()).style(style)
     }));
 
+    // Row highlight: the row at data_row_idx (if any) gets a subtle bg so
+    // users can see which row Enter would drill on. Distinct enough from
+    // the column-cursor gold tint that the two compose at the intersection
+    // (column + row both highlight → cell is the brightest).
+    let row_lit_style = Style::default().bg(Color::Rgb(40, 40, 60));
     let rows: Vec<Row> = app
         .preview
         .rows
         .iter()
-        .map(|r| {
-            Row::new(r.iter().enumerate().map(|(i, c)| {
+        .enumerate()
+        .map(|(row_idx, r)| {
+            let row_is_picked = app.data_row_idx == Some(row_idx);
+            let r = Row::new(r.iter().enumerate().map(|(i, c)| {
                 let w = col_widths[i] as usize;
                 let truncated = ellipsise(c, w);
                 let text = if numeric.get(i).copied().unwrap_or(false) {
@@ -1093,7 +1212,12 @@ fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
                 } else {
                     cell
                 }
-            }))
+            }));
+            if row_is_picked {
+                r.style(row_lit_style)
+            } else {
+                r
+            }
         })
         .collect();
 
@@ -1153,8 +1277,7 @@ fn render_status_bar(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
     // The completion-mode hint exists because the regular bar's keys
     // (Tab, Enter, ←/→) get rebound while the popup is up; surfacing the
     // override avoids the "why didn't Enter quit?" confusion.
-    let default_help =
-        " Tab next │ ␣ toggle col │ ⏎ append │ Q exit+print │ Esc/q quit │ : SQL │ ? help ";
+    let default_help = " Tab next │ ␣ toggle col │ ⏎ append/drill │ ⌫ undo drill │ Q exit+print │ Esc quit │ : SQL │ ? help ";
     let completion_help = " ↑↓ pick · ⏎/Tab insert · Esc cancel · keep typing to filter ";
     let text = match (&app.flash, app.completion.is_some()) {
         (Some((msg, _)), _) => msg.clone(),
@@ -1417,6 +1540,18 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
             Span::styled("  ← → / h l", key),
             Span::raw("             move column-cursor (lights up source field)"),
         ]),
+        Line::from(vec![
+            Span::styled("  ↑ ↓ / j k", key),
+            Span::raw("             move row-cursor"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter", key),
+            Span::raw("                drill down — replace query with `where .col == val …`"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Backspace", key),
+            Span::raw("            undo last drill-down (single level)"),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Query panel — DSL grammar quick ref", bold)),
         Line::from(Span::styled(
@@ -1674,6 +1809,67 @@ fn compute_completion(ta: &TextArea<'_>, columns: &[ColumnInfo]) -> Option<Compl
     })
 }
 
+/// Build a drill-down query from a row in the Data panel.
+///
+/// Walks `headers` left-to-right; for each header that is NOT an aggregate
+/// alias (per `lineage.derived`), emits a `.col == <literal>` clause using
+/// the matching cell value from `row`. Joins the clauses with ` and `,
+/// prefixed with `where `.
+///
+/// Returns None when there's nothing to filter on — happens when every
+/// header is a derived alias (e.g. `count` alone), or when the row has no
+/// matching cells. The caller flashes a "needs group_by" message in that
+/// case.
+///
+/// Examples:
+///   headers=["country","count"], row=["US","248"], lineage.derived=[count]
+///     → Some(`where .country == "US"`)
+///   headers=["country","region","sum_revenue"], row=["US","West","19065"]
+///     → Some(`where .country == "US" and .region == "West"`)
+///   headers=["count"], row=["1234"], lineage.derived=[count]
+///     → None
+fn build_drill_query(headers: &[String], row: &[String], lineage: &Lineage) -> Option<String> {
+    let mut clauses: Vec<String> = Vec::new();
+    for (i, h) in headers.iter().enumerate() {
+        // Skip aggregate aliases — they're not stable filter targets.
+        if lineage.derived.iter().any(|d| &d.alias == h) {
+            continue;
+        }
+        let Some(cell) = row.get(i) else { continue };
+        clauses.push(drill_clause(h, cell));
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(format!("where {}", clauses.join(" and ")))
+}
+
+/// Format a single drill-down clause: `.<header> == <literal>` or
+/// `.<header> IS NULL` for null cells. Type-detect the literal by
+/// re-using the `looks_numeric` heuristic from the data-table renderer:
+///   - "∅" or empty   → IS NULL
+///   - true / false   → bare boolean
+///   - looks_numeric  → bare number (no quotes)
+///   - everything else → "double-quoted" string (matches pq DSL convention,
+///     where double-quotes are rewritten to SQL single-quotes by the parser)
+///
+/// Strings get minimal escaping for embedded `\` and `"` — same dialect the
+/// rest of the parser already accepts.
+fn drill_clause(header: &str, cell: &str) -> String {
+    let t = cell.trim();
+    if t == "∅" || t.is_empty() {
+        return format!(".{header} IS NULL");
+    }
+    if t == "true" || t == "false" {
+        return format!(".{header} == {t}");
+    }
+    if looks_numeric(t) {
+        return format!(".{header} == {t}");
+    }
+    let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(".{header} == \"{escaped}\"")
+}
+
 /// Single-quote a string for shell consumption — escape embedded single quotes
 /// the POSIX way: `it's` → `'it'\''s'`.
 fn shell_quote(s: &str) -> String {
@@ -1913,5 +2109,114 @@ mod tests {
         assert_eq!(regex_escape("a.b"), r"a\.b");
         assert_eq!(regex_escape("price$"), r"price\$");
         assert_eq!(regex_escape("col[0]"), r"col\[0\]");
+    }
+
+    // ── v0.6 drill-down: clause + query builders ────────────────────────
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn drill_clause_quotes_strings() {
+        assert_eq!(drill_clause("country", "US"), r#".country == "US""#);
+    }
+
+    #[test]
+    fn drill_clause_bare_numbers() {
+        assert_eq!(drill_clause("age", "42"), ".age == 42");
+        assert_eq!(drill_clause("price", "3.14"), ".price == 3.14");
+        assert_eq!(drill_clause("delta", "-5"), ".delta == -5");
+    }
+
+    #[test]
+    fn drill_clause_bare_booleans() {
+        assert_eq!(drill_clause("active", "true"), ".active == true");
+        assert_eq!(drill_clause("active", "false"), ".active == false");
+    }
+
+    #[test]
+    fn drill_clause_null_is_null() {
+        assert_eq!(drill_clause("country", "∅"), ".country IS NULL");
+        assert_eq!(drill_clause("country", ""), ".country IS NULL");
+    }
+
+    #[test]
+    fn drill_clause_escapes_quotes_and_backslashes() {
+        // `"` inside the cell value gets backslash-escaped; the outer
+        // quotes wrap the whole thing.
+        assert_eq!(drill_clause("name", r#"O"Brien"#), r#".name == "O\"Brien""#);
+        assert_eq!(drill_clause("path", "C:\\x"), r#".path == "C:\\x""#);
+    }
+
+    fn lineage_with_aggs(aliases: &[&str]) -> Lineage {
+        // Synthesize a Lineage with given derived aliases. We don't care
+        // about column_refs for drill tests.
+        let derived = aliases
+            .iter()
+            .map(|a| crate::lineage::DerivedColumn {
+                alias: (*a).into(),
+                agg: "count".into(), // value irrelevant for drill build
+                source: None,
+            })
+            .collect();
+        Lineage {
+            column_refs: vec![],
+            derived,
+        }
+    }
+
+    #[test]
+    fn drill_query_single_grouping_col() {
+        let headers = s(&["country", "count"]);
+        let row = s(&["US", "248"]);
+        let l = lineage_with_aggs(&["count"]);
+        assert_eq!(
+            build_drill_query(&headers, &row, &l).as_deref(),
+            Some(r#"where .country == "US""#)
+        );
+    }
+
+    #[test]
+    fn drill_query_multi_grouping_cols() {
+        let headers = s(&["country", "region", "sum_revenue"]);
+        let row = s(&["US", "West", "19065"]);
+        let l = lineage_with_aggs(&["sum_revenue"]);
+        assert_eq!(
+            build_drill_query(&headers, &row, &l).as_deref(),
+            Some(r#"where .country == "US" and .region == "West""#)
+        );
+    }
+
+    #[test]
+    fn drill_query_returns_none_when_all_aggs() {
+        // `count` alone — no grouping columns.
+        let headers = s(&["count"]);
+        let row = s(&["1234"]);
+        let l = lineage_with_aggs(&["count"]);
+        assert_eq!(build_drill_query(&headers, &row, &l), None);
+    }
+
+    #[test]
+    fn drill_query_handles_null_grouping_cell() {
+        let headers = s(&["country", "count"]);
+        let row = s(&["∅", "17"]);
+        let l = lineage_with_aggs(&["count"]);
+        assert_eq!(
+            build_drill_query(&headers, &row, &l).as_deref(),
+            Some("where .country IS NULL")
+        );
+    }
+
+    #[test]
+    fn drill_query_with_numeric_grouping_value() {
+        // group_by .age | count → headers ["age","count"], row ["42","100"]
+        let headers = s(&["age", "count"]);
+        let row = s(&["42", "100"]);
+        let l = lineage_with_aggs(&["count"]);
+        assert_eq!(
+            build_drill_query(&headers, &row, &l).as_deref(),
+            Some("where .age == 42")
+        );
     }
 }
