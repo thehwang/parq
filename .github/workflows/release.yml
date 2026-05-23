@@ -127,3 +127,104 @@ jobs:
             dist/*.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # Bump the Homebrew formula in thehwang/homebrew-parq to point at this
+  # tag's URLs+sha256s. Runs after `release` so the assets exist when we
+  # fetch their .sha256 sidecars. Requires a HOMEBREW_TAP_GITHUB_TOKEN
+  # secret with write access to the tap repo (a fine-grained PAT scoped
+  # to thehwang/homebrew-parq with contents:write is enough).
+  #
+  # We regenerate the whole formula from a heredoc rather than using a
+  # third-party action because our formula has 3 platform stanzas
+  # (macOS arm/intel + linux x86_64) — most "bump formula" actions
+  # assume a single download-url and don't handle multi-platform.
+  homebrew-bump:
+    name: bump homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    # Skip pre-release tags (anything containing `-`, e.g. v1.0.0-rc1)
+    # so beta builds don't ship to brew users.
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Bump pq.rb in homebrew-parq
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Fail fast with a readable message if the PAT secret was never
+          # configured (one-time setup — see the workflow comment above).
+          # GitHub Actions can't gate `if:` on secrets, so the runtime
+          # check is the cleanest way to surface "you need to add the
+          # secret" instead of a cryptic git push 403.
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_GITHUB_TOKEN not set — skipping brew bump."
+            echo "::warning::To enable: gh secret set HOMEBREW_TAP_GITHUB_TOKEN -R thehwang/parq"
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          BASE="https://github.com/thehwang/parq/releases/download/${TAG}"
+
+          # Pull each platform's .sha256 sidecar from the release we
+          # just published. The `awk` trims any trailing filename so
+          # we keep just the hex digest.
+          fetch_sha() {
+            curl -fsSL "${BASE}/$1.sha256" | awk '{print $1}'
+          }
+          SHA_DARWIN_ARM=$(fetch_sha pq-aarch64-apple-darwin.tar.gz)
+          SHA_DARWIN_X86=$(fetch_sha pq-x86_64-apple-darwin.tar.gz)
+          SHA_LINUX=$(fetch_sha pq-x86_64-unknown-linux-musl.tar.gz)
+
+          # Clone the tap with the PAT, regen the formula in place,
+          # and push directly to main. The tap is single-formula and
+          # we trust release.yml — no PR review hop.
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/thehwang/homebrew-parq.git" tap
+          cd tap
+
+          cat > Formula/pq.rb <<EOF
+          class Pq < Formula
+            desc "jq for Parquet — query parquet files with concise expression syntax"
+            homepage "https://github.com/thehwang/parq"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/pq-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_ARM}"
+              end
+              on_intel do
+                url "${BASE}/pq-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_X86}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "${BASE}/pq-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "pq"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/pq --version")
+            end
+          end
+          EOF
+
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/pq.rb
+          # Skip if the formula didn't actually change (e.g. someone
+          # re-tagged the same SHA) — keeps the tap history clean.
+          if git diff --staged --quiet; then
+            echo "formula already at ${VERSION}; nothing to commit"
+            exit 0
+          fi
+          git commit -m "pq ${VERSION}"
+          git push origin main

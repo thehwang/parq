@@ -6,9 +6,9 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.6:** the TUI just grew teeth. Cursor on `sum_revenue` highlights the source `revenue` in the Columns panel (semantic sync); typing `.c` pops up a schema completion menu; `Enter` on any Data row drills down by adding a `where` clause; press `e` for an Explain panel with predicate/projection-pushdown facts and 💡 actionable suggestions. See [Interactive TUI](#interactive-tui-pq-tui-file) below.
+> **New in v0.7:** `brew install thehwang/parq/pq` finally works (Homebrew tap auto-bumps every release), and the Explain panel learned `EXPLAIN ANALYZE` — press capital `E` in the TUI to swap optimizer estimates for real wall-clock and actual row counts.
 >
-> _v0.5 added `pq tui FILE` — interactive lazygit-style 4-panel browser with live preview, editable DSL, and equivalent-CLI export on quit._
+> _v0.6 added semantic sync, schema completion, drill-down, and a heuristic-hint Explain panel to `pq tui`. v0.5 added the TUI itself._
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -167,6 +167,12 @@ and exit with `Q` to dump the equivalent `pq` CLI one-liner to stdout
   💡 heuristic hints when something obvious is missing —
   e.g. `💡 add 'where .dt = …' to prune partitions` if your path has
   hive segments but the query doesn't reference them.
+- **`EXPLAIN ANALYZE` on demand (`E`, capital).** Same panel, but the
+  numbers are real: actual rows, per-op timing, total wall-clock — and
+  if the optimizer's estimate diverged from reality by 10×+, you get a
+  💡 stale-stats hint. Power-feature only because it executes the full
+  query (no LIMIT 50 cap), so don't reflexively press `E` against a
+  remote 100 GB table.
 
 Keys at a glance (full list inside the TUI via `?`):
 
@@ -180,6 +186,7 @@ Keys at a glance (full list inside the TUI via `?`):
 | `Backspace` | undo last drill-down (Data panel) |
 | `:` | toggle compiled-SQL panel |
 | `e` | toggle Explain panel (pushdown facts + 💡 hints) |
+| `E` | run `EXPLAIN ANALYZE` — actual rows + per-op timing |
 | `?` | open help overlay (any key dismisses) |
 | `Q` | quit + print equivalent CLI |
 | `Esc` / `q` | quit; one Esc inside Query unfocuses first |
