@@ -1,0 +1,34 @@
+---
+source: src/tui.rs
+assertion_line: 3709
+---
+┌ Columns · 3 ─────────────┐┌ Query · 12 ms ───────────────────────────────────────────────────────┐
+│▶ ★ id  BIGINT            ││ try: '.email, .country where .country == "US"' or 'group_by .country │
+│    country  VARCHAR      ││                                                                      │
+│    revenu┌ ? help — press any key to dismiss ─────────────────────────────────────────┐          │
+│          │pq tui — keys                                                               │          │
+│          │                                                                            │──────────┘
+│          │  Tab / Shift-Tab    cycle focus (Columns ↔ Query ↔ Data)                   │──────────┐
+│          │  Esc / q              quit (one Esc inside Query unfocuses first)          │          │
+│          │  Q                    quit + print equivalent pq CLI to stdout             │          │
+│          │  Y                    flash equivalent CLI in status bar                   │          │
+│          │  :                    toggle compiled-SQL panel                            │          │
+│          │  e                    toggle Explain panel (pushdown + 💡  hints)           │          │
+│          │  E                    run EXPLAIN ANALYZE — actuals + per-op timing        │          │
+│          │                       (runs in background; Esc cancels)                    │          │
+│          │  Ctrl-↑ / Ctrl-↓       browse query history (in Query panel)               │          │
+│          │  ?                    this help (any key dismisses)                        │          │
+│          │  Ctrl-C               force quit (works through any modal)                 │          │
+│          │                                                                            │          │
+│          │Semantic sync (v0.6)                                                        │          │
+│          │  Cursor on .col / sum_col → Columns highlights ★ revenue, etc.             │          │
+│          │  Type `.co` in Query → schema completion popup (⏎/Tab to accept)           │          │
+└──────────│                                                                            │          │
+┌ Filters ·│Columns panel                                                               │          │
+│(none — ty│  ↑ ↓ / k j            move cursor                                          │          │
+│          │  Space                toggle column in projection                          │          │
+│          │  Enter                append column to projection (no toggle off)          │          │
+│          └────────────────────────────────────────────────────────────────────────────┘          │
+│                          ││                                                                      │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
+ Tab next │ ␣ toggle │ ⏎ append/drill │ ⌫ undo │ Q exit+print │ Esc quit │ : SQL │ e Explain │ E ANA

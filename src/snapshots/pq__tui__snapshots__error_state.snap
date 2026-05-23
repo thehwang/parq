@@ -1,0 +1,28 @@
+---
+source: src/tui.rs
+assertion_line: 3719
+---
+┌ Columns · 3 ─────────────┐┌ Query · ⚠ parse: unknown column .nope ───────────────────────────────┐
+│▶ ★ id  BIGINT            ││.nope                                                                 │
+│    country  VARCHAR      ││                                                                      │
+│    revenue  DOUBLE       ││                                                                      │
+│                          ││                                                                      │
+│                          │└──────────────────────────────────────────────────────────────────────┘
+│                          │┌ Data · 0 of 0 rows shown ────────────────────────────────────────────┐
+│                          ││error:                                                                │
+│                          ││  parse: unknown column .nope                                         │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+└──────────────────────────┘│                                                                      │
+┌ Filters · 0 ─────────────┐│                                                                      │
+│(none — type `where .col =││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
+ Tab next │ ␣ toggle │ ⏎ append/drill │ ⌫ undo │ Q exit+print │ Esc quit │ : SQL │ e Explain │ E ANA

@@ -1,6 +1,6 @@
 [package]
 name = "pq"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "jq for Parquet — query parquet files with a concise expression syntax"
 authors = ["Hua Wang <thehwang@users.noreply.github.com>"]
@@ -33,6 +33,13 @@ crossterm = "0.28"
 # (semantic sync, v0.6). It pulls in the `regex` crate transitively, but
 # we already escape user input in regex_escape() so the surface is safe.
 tui-textarea = { version = "0.7", features = ["search"] }
+
+[dev-dependencies]
+# v0.8 snapshot tests for the TUI rendering. We feed a fake App into
+# ratatui's TestBackend, dump the resulting text buffer, and let insta
+# diff it against committed `*.snap` files. Keeps regressions in
+# layout / labels / panel composition from sneaking in unnoticed.
+insta = "1.40"
 
 [profile.release]
 opt-level = 3

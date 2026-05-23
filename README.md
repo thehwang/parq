@@ -6,9 +6,11 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.7:** `brew install thehwang/parq/pq` finally works (Homebrew tap auto-bumps every release), and the Explain panel learned `EXPLAIN ANALYZE` — press capital `E` in the TUI to swap optimizer estimates for real wall-clock and actual row counts.
+> **New in v0.8:** `EXPLAIN ANALYZE` now runs off the UI thread — capital `E` returns instantly with a "running…" timer in the panel header, and `Esc` cancels mid-flight. Press `Ctrl-↑/Ctrl-↓` in the Query panel to browse persisted query history (`~/.pq/history`). Snapshot tests + a VHS smoke test guard the TUI in CI on every PR.
 >
-> _v0.6 added semantic sync, schema completion, drill-down, and a heuristic-hint Explain panel to `pq tui`. v0.5 added the TUI itself._
+> _v0.7: Homebrew tap (`brew install thehwang/parq/pq`) and `EXPLAIN ANALYZE` on demand. v0.6: semantic sync, schema completion, drill-down, heuristic-hint Explain panel. v0.5: the TUI itself._
+>
+> Already on Homebrew? `brew upgrade pq` to grab v0.8.
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -186,7 +188,8 @@ Keys at a glance (full list inside the TUI via `?`):
 | `Backspace` | undo last drill-down (Data panel) |
 | `:` | toggle compiled-SQL panel |
 | `e` | toggle Explain panel (pushdown facts + 💡 hints) |
-| `E` | run `EXPLAIN ANALYZE` — actual rows + per-op timing |
+| `E` | run `EXPLAIN ANALYZE` — actual rows + per-op timing (Esc cancels) |
+| `Ctrl-↑` / `Ctrl-↓` | browse persisted query history (Query panel) |
 | `?` | open help overlay (any key dismisses) |
 | `Q` | quit + print equivalent CLI |
 | `Esc` / `q` | quit; one Esc inside Query unfocuses first |

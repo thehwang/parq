@@ -26,7 +26,12 @@
 // Out of scope (v0.6+): semantic cursor sync, explain panel, drill-down,
 // query history, multi-file tabs, join builder, schema diff.
 
+use std::env;
+use std::fs;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -57,6 +62,10 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 const PREVIEW_LIMIT: usize = 50;
 const SQL_THROTTLE: Duration = Duration::from_millis(50);
+/// Cap on persisted query history. 100 entries fits ~10 KB on disk;
+/// browsing 100 is already too many — anyone wanting more should
+/// graduate to a fuzzy-search popup (v0.9 idea).
+const HISTORY_MAX: usize = 100;
 
 /// Ghost-text shown in the empty Query panel so first-time users see what
 /// the DSL accepts. tui-textarea hides it on the first keystroke. Kept
@@ -167,6 +176,22 @@ struct ExplainSummary {
     /// Wall-clock from `Total Time: X.Ys` at the top of the ANALYZE tree.
     /// None for plain EXPLAIN. Seconds, not ms — DuckDB's native unit.
     total_seconds: Option<f64>,
+}
+
+/// Handle to an in-flight EXPLAIN ANALYZE worker. Owns the receiver
+/// end of an mpsc channel; the worker thread holds the matching
+/// sender. We deliberately don't carry the worker's JoinHandle —
+/// when the user cancels (drops `analyze_job`), we just orphan the
+/// thread. It'll send into a disconnected tx, ignore the error, and
+/// exit. Cheap, no unsafe, no extra DuckDB plumbing.
+#[derive(Debug)]
+struct AnalyzeJob {
+    /// Result channel — `try_recv` non-blockingly each tick.
+    rx: mpsc::Receiver<ExplainSummary>,
+    /// Stamp used by the panel header to render
+    /// "ANALYZE running… 1.2 s" so the user can tell whether it's
+    /// hung vs just slow.
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -619,15 +644,12 @@ struct App<'ta> {
     /// Query). Surfaces the Explain panel below Data: scan summary,
     /// pushdown facts, and 💡 heuristic suggestions.
     show_explain: bool,
-    /// One-shot flag set by `E` (capital). Picked up by the run loop to
-    /// kick off `run_analyze` against the *full* query (no LIMIT 50
-    /// wrapper) — i.e. it actually executes the query for real
-    /// cardinalities and per-op timing.
-    analyze_requested: bool,
-    /// True only during the synchronous `run_analyze` call. Powers the
-    /// "ANALYZE running…" badge so the user gets feedback before the
-    /// blocking call returns. Cleared right after.
-    analyze_in_flight: bool,
+    /// In-flight EXPLAIN ANALYZE worker. Set when capital `E` is
+    /// pressed; cleared when the worker delivers a result OR the user
+    /// hits `Esc` to abandon it. Runs on a dedicated thread so the TUI
+    /// stays responsive — even on remote/large parquet files where
+    /// ANALYZE can take seconds.
+    analyze_job: Option<AnalyzeJob>,
     /// True when `?` is pressed → renders a centred help overlay over the
     /// 4-panel layout. Any subsequent key dismisses it (so `?` then start
     /// typing in Query feels natural).
@@ -642,6 +664,22 @@ struct App<'ta> {
     should_quit: bool,
     /// Set on quit when we want to print the equivalent CLI to stdout.
     print_cli_on_exit: bool,
+
+    // ── v0.8: query history navigation (Ctrl-↑ / Ctrl-↓) ────────────────────
+    /// Persisted DSL queries from prior sessions, newest first. Loaded
+    /// once at startup from ~/.pq/history; appended to whenever a new
+    /// distinct compile lands. Capped at HISTORY_MAX so the file doesn't
+    /// grow without bound.
+    history: Vec<String>,
+    /// Active history-cursor position when the user is paging via
+    /// Ctrl-↑/Ctrl-↓. None means "I'm typing fresh, history is dormant"
+    /// — the next Ctrl-↑ saves the textarea contents into `history_draft`
+    /// and starts paging from index 0.
+    history_idx: Option<usize>,
+    /// Snapshot of whatever the user had typed when they kicked off
+    /// history paging. Restored when they Ctrl-↓ all the way back to
+    /// the present, so navigating history is non-destructive.
+    history_draft: Option<String>,
 
     // ── v0.6: semantic sync + completion ────────────────────────────────────
     //
@@ -722,14 +760,16 @@ impl<'ta> App<'ta> {
             focus: Panel::Columns,
             show_sql: false,
             show_explain: false,
-            analyze_requested: false,
-            analyze_in_flight: false,
+            analyze_job: None,
             show_help: false,
             last_compiled: String::new(),
             pending_compile_at: None,
             flash: None,
             should_quit: false,
             print_cli_on_exit: false,
+            history: load_history(),
+            history_idx: None,
+            history_draft: None,
             lineage: Lineage::default(),
             data_col_idx: None,
             data_row_idx: None,
@@ -738,8 +778,192 @@ impl<'ta> App<'ta> {
         })
     }
 
+    /// Test-only constructor: build an App with no DuckDB connection
+    /// and a hardcoded schema/preview. Used by the v0.8 snapshot tests
+    /// to feed `render` deterministic state without spinning up DuckDB
+    /// or hitting the filesystem.
+    #[cfg(test)]
+    fn for_test(file: impl Into<String>, columns: Vec<ColumnInfo>, preview: Preview) -> Self {
+        let mut column_state = ListState::default();
+        if !columns.is_empty() {
+            column_state.select(Some(0));
+        }
+        let mut query = TextArea::default();
+        query.set_block(Block::default().borders(Borders::ALL).title(" Query "));
+        query.set_placeholder_text(QUERY_PLACEHOLDER);
+        query.set_placeholder_style(Style::default().fg(Color::DarkGray));
+        Self {
+            file: file.into(),
+            columns,
+            column_state,
+            query,
+            preview,
+            focus: Panel::Columns,
+            show_sql: false,
+            show_explain: false,
+            analyze_job: None,
+            show_help: false,
+            last_compiled: String::new(),
+            pending_compile_at: None,
+            flash: None,
+            should_quit: false,
+            print_cli_on_exit: false,
+            // Snapshot tests must NOT pull in the user's real history
+            // file — keep the buffer empty so we get reproducible output.
+            history: Vec::new(),
+            history_idx: None,
+            history_draft: None,
+            lineage: Lineage::default(),
+            data_col_idx: None,
+            data_row_idx: None,
+            drill_undo: None,
+            completion: None,
+        }
+    }
+
     fn current_query_text(&self) -> String {
         self.query.lines().join("\n")
+    }
+
+    /// Append `q` to the in-memory history (most-recent-first), dedupe
+    /// against the head so retyping the same query doesn't bloat
+    /// history, cap at HISTORY_MAX, and persist. Persistence is
+    /// best-effort — any IO error is silently swallowed because losing
+    /// history is annoying but not user-blocking.
+    fn record_history(&mut self, q: String) {
+        if self.history.first().map(String::as_str) == Some(q.as_str()) {
+            return;
+        }
+        // Drop any earlier exact match further down the list — we want
+        // a single entry per distinct query, always at the top after
+        // most recent use.
+        self.history.retain(|h| h != &q);
+        self.history.insert(0, q);
+        if self.history.len() > HISTORY_MAX {
+            self.history.truncate(HISTORY_MAX);
+        }
+        save_history(&self.history);
+    }
+
+    /// Load `history[idx]` into the textarea, saving the current
+    /// editor contents into `history_draft` on first entry. Returns
+    /// false when `idx` is out of bounds (caller should clamp / no-op).
+    fn show_history(&mut self, idx: usize) -> bool {
+        if idx >= self.history.len() {
+            return false;
+        }
+        if self.history_idx.is_none() {
+            self.history_draft = Some(self.current_query_text());
+        }
+        self.history_idx = Some(idx);
+        let entry = self.history[idx].clone();
+        self.replace_query_text(&entry);
+        true
+    }
+
+    /// Restore the in-flight draft (the text the user had typed before
+    /// they started paging history). Called when the user Ctrl-↓'s all
+    /// the way back to the bottom — paging history shouldn't destroy
+    /// in-progress edits.
+    fn exit_history(&mut self) {
+        if let Some(draft) = self.history_draft.take() {
+            self.replace_query_text(&draft);
+        }
+        self.history_idx = None;
+    }
+
+    /// Replace the textarea contents wholesale and reschedule a compile.
+    /// Wraps the existing `replace_query` (used by drill-down) but
+    /// skips `schedule_compile` so we don't clear analyze_job — when
+    /// the user is paging history we leave any in-flight ANALYZE
+    /// alone (it'll get cleared on the *next* compile anyway).
+    fn replace_query_text(&mut self, text: &str) {
+        self.replace_query(text.to_string());
+        self.pending_compile_at = Some(Instant::now() + SQL_THROTTLE);
+    }
+
+    /// Kick off an EXPLAIN ANALYZE on a worker thread. Cancels and
+    /// replaces any in-flight job (the user pressed `E` again — they
+    /// want fresh numbers, not stale ones from a previous query).
+    ///
+    /// Each invocation gets its own DuckDB connection because:
+    /// - duckdb-rs `Connection` isn't Sync (can't borrow from two
+    ///   threads simultaneously), so the main TUI loop must keep its
+    ///   own connection live for live-preview compiles.
+    /// - Spinning up a fresh in-memory connection + httpfs + secrets
+    ///   takes ~50 ms — noise compared to the query itself, even for
+    ///   trivial files. For remote parquet, opening multiple
+    ///   connections lets analyze run concurrently with previews.
+    fn start_analyze(&mut self) {
+        // Drop any outstanding job by reassignment — the worker will
+        // discover its tx is disconnected when it tries to send and
+        // exit cleanly. Its query continues running in the background
+        // until DuckDB notices (we don't actively interrupt because
+        // duckdb-rs Connection isn't Sync; the cleanup is "best-effort
+        // forget"). Worth revisiting if it shows up in profiles.
+        self.analyze_job = None;
+        if self.preview.sql.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let plan_sql = self.preview.sql.clone();
+        let file = self.file.clone();
+        let query = self.current_query_text();
+        thread::spawn(move || {
+            // Each thread owns its own connection — created lazily on
+            // entry, dropped at scope exit. This is also where the
+            // cloud-secret env vars get re-injected, so analyze
+            // queries against gs:// / s3:// pick up the same
+            // credentials the main TUI is using.
+            let Ok(conn) = crate::open_conn() else {
+                return;
+            };
+            if let Some(summary) = run_analyze(&conn, &plan_sql, &file, &query) {
+                // tx.send returns Err when the receiver was dropped
+                // (user pressed Esc to cancel). That's expected — we
+                // silently discard the result instead of panicking.
+                let _ = tx.send(summary);
+            }
+        });
+        self.analyze_job = Some(AnalyzeJob {
+            rx,
+            started_at: Instant::now(),
+        });
+    }
+
+    /// Drop the in-flight ANALYZE job's receiver. The worker thread
+    /// keeps running its query until DuckDB finishes, but its result
+    /// is now orphaned (silently discarded by tx.send when it tries
+    /// to deliver). The badge clears immediately for snappy UX.
+    fn cancel_analyze(&mut self) -> bool {
+        if self.analyze_job.is_some() {
+            self.analyze_job = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Non-blocking check: did the worker thread finish? If so, swap
+    /// its summary into `preview.explain`. Called once per run-loop
+    /// tick so results show up within ~50 ms of completion.
+    fn poll_analyze(&mut self) {
+        let Some(job) = &self.analyze_job else { return };
+        match job.rx.try_recv() {
+            Ok(summary) => {
+                self.preview.explain = Some(summary);
+                self.analyze_job = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Still running — keep showing the badge.
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Worker died without sending (e.g. crate::open_conn
+                // failed, or run_analyze returned None on a parser
+                // error). Clear the job so the panel header reverts.
+                self.analyze_job = None;
+            }
+        }
     }
 
     fn equivalent_cli(&self) -> String {
@@ -753,6 +977,11 @@ impl<'ta> App<'ta> {
 
     fn schedule_compile(&mut self) {
         self.pending_compile_at = Some(Instant::now() + SQL_THROTTLE);
+        // Any in-flight ANALYZE was scoped to the OLD query — its
+        // numbers won't match what's about to render. Drop the
+        // receiver; the worker thread keeps running but its result
+        // gets orphaned. User can press `E` again on the new query.
+        self.analyze_job = None;
     }
 
     fn maybe_run_compile(&mut self, conn: &Connection) {
@@ -762,6 +991,13 @@ impl<'ta> App<'ta> {
                 if q != self.last_compiled {
                     self.preview = run_preview(conn, &self.file, &q);
                     self.last_compiled = q.clone();
+                    // Record successful (non-empty, non-error) queries
+                    // in history. We don't gate on preview.error — even
+                    // a query that errored is something the user might
+                    // want to recall and fix later.
+                    if !q.trim().is_empty() {
+                        self.record_history(q.clone());
+                    }
                     // After the data refreshes, both the column- and row-
                     // cursor may now point past the end of the new
                     // headers/rows (e.g. user changed projection from 3
@@ -865,6 +1101,11 @@ impl<'ta> App<'ta> {
 
     fn replace_query(&mut self, text: String) {
         let mut new_ta = TextArea::default();
+        // Keep the same ghost-text placeholder + styling that App::new
+        // sets up — without this, replacing with empty text would lose
+        // the "(.col1, .col2 where … | group_by …)" hint.
+        new_ta.set_placeholder_text(QUERY_PLACEHOLDER);
+        new_ta.set_placeholder_style(Style::default().fg(Color::DarkGray));
         new_ta.insert_str(&text);
         new_ta.set_block(Block::default().borders(Borders::ALL).title(" Query "));
         self.query = new_ta;
@@ -1048,6 +1289,16 @@ fn on_key(app: &mut App<'_>, key: KeyEvent) {
         app.show_help = false;
         return;
     }
+    // ── Esc cancels an in-flight ANALYZE before anything else. ────────
+    // Without this, Esc in Columns/Data would quit the TUI even though
+    // the user almost certainly meant "stop the slow analyze, I changed
+    // my mind". Esc in the Query panel still falls through to its
+    // normal "drop focus" behavior on the second press. We don't
+    // shortcut Tab/BackTab so the user can keep navigating panels even
+    // while the worker thread is alive in the background.
+    if key.code == KeyCode::Esc && app.cancel_analyze() {
+        return;
+    }
     if key.code == KeyCode::Tab {
         app.focus = app.focus.next();
         return;
@@ -1079,7 +1330,7 @@ fn on_key_columns(app: &mut App<'_>, key: KeyEvent) {
         KeyCode::Char('e') => app.show_explain = !app.show_explain,
         KeyCode::Char('E') => {
             app.show_explain = true;
-            app.analyze_requested = true;
+            app.start_analyze();
         }
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Enter => app.append_current_column(),
@@ -1155,6 +1406,32 @@ fn on_key_query(app: &mut App<'_>, key: KeyEvent) {
                 app.copy_cli_to_clipboard();
                 return;
             }
+            // ── Query history navigation (v0.8) ─────────────────────────
+            // We use Ctrl-Up/Down rather than bare Up/Down so the
+            // textarea's intra-buffer arrow-key navigation still
+            // works for multi-line queries. The trade-off: discoverable
+            // only via `?`. Documented in the help overlay.
+            KeyCode::Up => {
+                let next = app.history_idx.map_or(0, |i| i + 1);
+                if app.show_history(next) {
+                    app.refresh_lineage();
+                    app.refresh_completion();
+                }
+                return;
+            }
+            KeyCode::Down => match app.history_idx {
+                Some(0) => {
+                    app.exit_history();
+                    app.refresh_lineage();
+                    app.refresh_completion();
+                }
+                Some(i) => {
+                    app.show_history(i - 1);
+                    app.refresh_lineage();
+                    app.refresh_completion();
+                }
+                None => {} // Already at "live" position; nothing to do.
+            },
             _ => {}
         }
     }
@@ -1162,6 +1439,15 @@ fn on_key_query(app: &mut App<'_>, key: KeyEvent) {
     let consumed = app.query.input(key);
     if consumed {
         app.schedule_compile();
+        // Once the user starts editing, they're no longer browsing
+        // history — the draft they had stashed is now this newly-
+        // edited buffer. Clear the paging cursor so the next Ctrl-↑
+        // starts fresh at index 0 (most-recent), not from wherever
+        // they happened to land while browsing.
+        if app.history_idx.is_some() {
+            app.history_idx = None;
+            app.history_draft = None;
+        }
     }
     // Lineage and completion are derived state — refresh after every event,
     // including pure cursor-moves (Left/Right/Home/End/...) which don't
@@ -1186,7 +1472,7 @@ fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
         KeyCode::Char('e') => app.show_explain = !app.show_explain,
         KeyCode::Char('E') => {
             app.show_explain = true;
-            app.analyze_requested = true;
+            app.start_analyze();
         }
         KeyCode::Char('?') => app.show_help = true,
         // ── v0.6: column-cursor navigation. ───────────────────────────────
@@ -1814,11 +2100,18 @@ fn render_explain(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
     let warn = Style::default().fg(Color::Rgb(255, 215, 0)); // gold (matches ★)
     let analyzed_color = Style::default().fg(Color::Rgb(0, 200, 220)); // teal accent
 
-    // Title varies by state: in-flight ANALYZE, post-ANALYZE summary,
-    // or plain EXPLAIN. Keep all three distinct so the user always
-    // knows whether they're looking at estimates or actuals.
-    let title = if app.analyze_in_flight {
-        " Explain · ANALYZE running… ".to_string()
+    // Title varies by state: in-flight ANALYZE (with live elapsed
+    // ticker), post-ANALYZE summary, or plain EXPLAIN. Keep all three
+    // distinct so the user always knows whether they're looking at
+    // estimates, actuals, or a query that's still computing.
+    let title = if let Some(job) = &app.analyze_job {
+        let elapsed = job.started_at.elapsed();
+        let stamp = if elapsed.as_secs() < 1 {
+            format!("{:.1}s", elapsed.as_secs_f64())
+        } else {
+            format!("{:.0}s", elapsed.as_secs_f64())
+        };
+        format!(" Explain · ANALYZE running… {stamp} — Esc to cancel ")
     } else {
         match &app.preview.explain {
             Some(e) if e.analyzed => match e.total_seconds {
@@ -1977,6 +2270,65 @@ fn fmt_count(n: u64) -> String {
     }
 }
 
+// ─── v0.8: persisted query history ───────────────────────────────────────────
+
+/// Resolve the on-disk history file location.
+///
+/// `$HOME/.pq/history` on unix, `%USERPROFILE%\.pq\history` on Windows.
+/// We don't bother with XDG_DATA_HOME / Application Support nuances —
+/// a single dotfile path is what users expect from history files
+/// (.bash_history, .lesshst, .psql_history all work this way) and it
+/// works portably with zero extra deps.
+///
+/// Returns None when neither $HOME nor %USERPROFILE% is set, in which
+/// case we just disable persistence (history still works in-session).
+fn history_path() -> Option<PathBuf> {
+    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".pq").join("history"))
+}
+
+/// Load history from disk. Newline-separated; blanks skipped. Newest
+/// entries at the top of the file (matches in-memory ordering). All
+/// errors swallowed — losing history is annoying but never blocking.
+fn load_history() -> Vec<String> {
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(HISTORY_MAX)
+        .map(String::from)
+        .collect()
+}
+
+/// Persist `entries` to disk, creating `$HOME/.pq/` if it doesn't yet
+/// exist. Best-effort — silently no-ops on any IO error so a read-only
+/// home dir / disk-full scenario never breaks the TUI.
+fn save_history(entries: &[String]) {
+    let Some(path) = history_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // We write the whole file each time. With HISTORY_MAX=100 and
+    // typical queries < 200 chars, that's < 20 KB — irrelevant on
+    // any modern filesystem. Append mode would be more efficient but
+    // wouldn't handle dedup-and-promote ("retype an old query, watch
+    // it pop to the top") which `record_history` does in memory.
+    let body: String = entries
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = fs::write(&path, body);
+}
+
 /// Render the schema-completion popup right under the textarea cursor. We
 /// keep the popup small (max 8 rows, max 32 cols wide) and clamp it to stay
 /// inside the screen — if the cursor is near the bottom of the query area,
@@ -2126,8 +2478,12 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
             Span::raw("                    run EXPLAIN ANALYZE — actuals + per-op timing"),
         ]),
         Line::from(vec![Span::raw(
-            "                       (executes the query — slow on big files)",
+            "                       (runs in background; Esc cancels)",
         )]),
+        Line::from(vec![
+            Span::styled("  Ctrl-↑ / Ctrl-↓", key),
+            Span::raw("       browse query history (in Query panel)"),
+        ]),
         Line::from(vec![
             Span::styled("  ?", key),
             Span::raw("                    this help (any key dismisses)"),
@@ -2280,6 +2636,10 @@ fn run_app(terminal: &mut Tui, app: &mut App<'_>, conn: &Connection) -> Result<(
             Some(t) => t
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(20)),
+            // While ANALYZE is in flight, poll faster so the elapsed
+            // timer in the panel header ticks smoothly and finished
+            // results show up within ~50 ms instead of ~200.
+            None if app.analyze_job.is_some() => Duration::from_millis(50),
             None => Duration::from_millis(200),
         };
 
@@ -2292,27 +2652,11 @@ fn run_app(terminal: &mut Tui, app: &mut App<'_>, conn: &Connection) -> Result<(
         }
 
         app.maybe_run_compile(conn);
-
-        // ── EXPLAIN ANALYZE (capital `E` requested it) ─────────────────────
-        // We process this *after* compile, so the `app.preview.sql` we
-        // run against is fresh — and skip when the compile errored
-        // (empty SQL means there's nothing meaningful to analyze).
-        if app.analyze_requested {
-            app.analyze_requested = false;
-            if !app.preview.sql.is_empty() {
-                app.analyze_in_flight = true;
-                // Render once before the blocking call so the user sees
-                // an "ANALYZE running…" badge — without this they'd just
-                // see the TUI freeze on a slow query.
-                terminal.draw(|f| render(f, app))?;
-                let plan_sql = app.preview.sql.clone();
-                let query = app.current_query_text();
-                if let Some(summary) = run_analyze(conn, &plan_sql, &app.file, &query) {
-                    app.preview.explain = Some(summary);
-                }
-                app.analyze_in_flight = false;
-            }
-        }
+        // Pull any completed ANALYZE result off the worker channel.
+        // Cheap (single non-blocking try_recv) so it's fine to call
+        // every tick — keeps result latency under one event-poll
+        // timeout (~200 ms) without forcing a wakeup-on-completion.
+        app.poll_analyze();
 
         // Auto-clear flash messages after 3s.
         if let Some((_, t)) = app.flash {
@@ -3133,5 +3477,256 @@ TABLE_SCAN
         assert_eq!(fmt_count(1_500), "1.5k");
         assert_eq!(fmt_count(2_400_000), "2.4M");
         assert_eq!(fmt_count(7_800_000_000), "7.8B");
+    }
+
+    // ── v0.8: history bookkeeping ───────────────────────────────────────────
+
+    #[test]
+    fn history_dedupes_consecutive_writes() {
+        let mut app = App::for_test("demo.parquet", Vec::new(), Preview::default());
+        app.record_history(".country".into());
+        app.record_history(".country".into());
+        assert_eq!(app.history, vec![".country".to_string()]);
+    }
+
+    #[test]
+    fn history_promotes_repeat_to_top() {
+        let mut app = App::for_test("demo.parquet", Vec::new(), Preview::default());
+        app.record_history(".a".into());
+        app.record_history(".b".into());
+        app.record_history(".a".into());
+        assert_eq!(
+            app.history,
+            vec![".a".to_string(), ".b".to_string()],
+            "retyped query should promote, not duplicate"
+        );
+    }
+
+    #[test]
+    fn history_caps_at_history_max() {
+        let mut app = App::for_test("demo.parquet", Vec::new(), Preview::default());
+        for i in 0..(HISTORY_MAX + 10) {
+            app.record_history(format!(".col{i}"));
+        }
+        assert_eq!(app.history.len(), HISTORY_MAX);
+        // Newest at the head, oldest dropped.
+        assert!(app
+            .history
+            .first()
+            .unwrap()
+            .ends_with(&format!("{}", HISTORY_MAX + 9)));
+    }
+}
+
+// ── v0.8: TUI rendering snapshot tests ───────────────────────────────────────
+//
+// Drive `render` against a fake App with hand-built Preview/columns and
+// snapshot the resulting text buffer with insta. Catches regressions in
+// layout, panel labels, status-bar wording, completion popup geometry,
+// help overlay, etc. — anywhere structural breakage would otherwise
+// require a human to spot in a screenshot.
+//
+// Snapshots strip ANSI styling; they only cover *characters*. Color and
+// emphasis regressions are out of scope (would force snapshot churn on
+// every palette tweak). When a test fails, regenerate with:
+//
+//   cargo insta review     # interactive
+//   cargo insta accept     # accept all pending
+//
+// New snapshots are committed under src/snapshots/.
+#[cfg(test)]
+mod snapshots {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+    use ratatui::Terminal;
+
+    fn make_columns() -> Vec<ColumnInfo> {
+        vec![
+            ColumnInfo {
+                name: "id".into(),
+                ty: "BIGINT".into(),
+                selected: false,
+            },
+            ColumnInfo {
+                name: "country".into(),
+                ty: "VARCHAR".into(),
+                selected: false,
+            },
+            ColumnInfo {
+                name: "revenue".into(),
+                ty: "DOUBLE".into(),
+                selected: false,
+            },
+        ]
+    }
+
+    fn make_preview() -> Preview {
+        Preview {
+            headers: vec!["country".into(), "revenue".into()],
+            rows: vec![
+                vec!["US".into(), "100.50".into()],
+                vec!["DE".into(), "85.00".into()],
+                vec!["JP".into(), "63.20".into()],
+            ],
+            sql: "SELECT country, revenue FROM read_parquet('demo.parquet') LIMIT 50".into(),
+            last_ms: 12,
+            error: None,
+            explain: None,
+        }
+    }
+
+    fn buffer_to_text(buf: &Buffer) -> String {
+        let area = buf.area();
+        (0..area.height)
+            .map(|y| {
+                let line: String = (0..area.width)
+                    .map(|x| {
+                        buf.cell(Position::new(x, y))
+                            .map(|c| c.symbol())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                line.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_to_string(app: &mut App<'_>, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|f| render(f, app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        buffer_to_text(&buf)
+    }
+
+    /// Insta wrapper that uses a stable, descriptive name and disables
+    /// the file/line prefix so renames don't churn the snapshot tree.
+    macro_rules! snap {
+        ($name:literal, $body:expr) => {{
+            insta::with_settings!({ omit_expression => true }, {
+                insta::assert_snapshot!($name, $body);
+            });
+        }};
+    }
+
+    #[test]
+    fn snap_empty() {
+        let mut app = App::for_test("demo.parquet", make_columns(), Preview::default());
+        let s = render_to_string(&mut app, 100, 24);
+        snap!("empty", s);
+    }
+
+    #[test]
+    fn snap_with_results() {
+        let mut app = App::for_test("demo.parquet", make_columns(), make_preview());
+        // Mark country/revenue as selected (string-match would do this in
+        // real life when the user types `.country, .revenue`).
+        app.columns[1].selected = true;
+        app.columns[2].selected = true;
+        app.query.insert_str(".country, .revenue");
+        let s = render_to_string(&mut app, 100, 24);
+        snap!("with_results", s);
+    }
+
+    #[test]
+    fn snap_show_sql() {
+        let mut app = App::for_test("demo.parquet", make_columns(), make_preview());
+        app.show_sql = true;
+        let s = render_to_string(&mut app, 100, 24);
+        snap!("show_sql", s);
+    }
+
+    #[test]
+    fn snap_explain_panel_estimates() {
+        let mut preview = make_preview();
+        preview.explain = Some(ExplainSummary {
+            scans: vec![ScanInfo {
+                filters: vec!["country='US'".into()],
+                projections: vec!["country".into(), "revenue".into()],
+                estimated_rows: Some(1234),
+                actual_rows: None,
+                files_read: None,
+            }],
+            suggestions: vec!["💡 add `where .partition_date >= ...` to prune row groups".into()],
+            raw: "PARQUET_SCAN ~1234 rows".into(),
+            analyzed: false,
+            total_seconds: None,
+        });
+        let mut app = App::for_test("demo.parquet", make_columns(), preview);
+        app.show_explain = true;
+        let s = render_to_string(&mut app, 110, 28);
+        snap!("explain_panel_estimates", s);
+    }
+
+    #[test]
+    fn snap_analyze_completed() {
+        let mut preview = make_preview();
+        preview.explain = Some(ExplainSummary {
+            scans: vec![ScanInfo {
+                filters: vec!["country='US'".into()],
+                projections: vec!["country".into(), "revenue".into()],
+                estimated_rows: Some(1234),
+                actual_rows: Some(1100),
+                files_read: Some(3),
+            }],
+            suggestions: vec![],
+            raw: "PARQUET_SCAN ~1234 rows / 1100 rows".into(),
+            analyzed: true,
+            total_seconds: Some(0.0152),
+        });
+        let mut app = App::for_test("demo.parquet", make_columns(), preview);
+        app.show_explain = true;
+        let s = render_to_string(&mut app, 110, 28);
+        snap!("analyze_completed", s);
+    }
+
+    #[test]
+    fn snap_completion_popup() {
+        let mut app = App::for_test("demo.parquet", make_columns(), make_preview());
+        app.focus = Panel::Query;
+        app.query.insert_str(".co");
+        // Drive the real completion logic so the popup state matches what
+        // a user would see — keeps the snapshot honest if the matching
+        // logic changes (e.g. adds fuzzy ranking).
+        app.refresh_completion();
+        let s = render_to_string(&mut app, 100, 24);
+        snap!("completion_popup", s);
+    }
+
+    #[test]
+    fn snap_help_overlay() {
+        let mut app = App::for_test("demo.parquet", make_columns(), make_preview());
+        app.show_help = true;
+        let s = render_to_string(&mut app, 100, 30);
+        snap!("help_overlay", s);
+    }
+
+    #[test]
+    fn snap_error_state() {
+        let preview = Preview {
+            error: Some("parse: unknown column .nope".into()),
+            ..Default::default()
+        };
+        let mut app = App::for_test("demo.parquet", make_columns(), preview);
+        app.query.insert_str(".nope");
+        let s = render_to_string(&mut app, 100, 24);
+        snap!("error_state", s);
+    }
+
+    #[test]
+    fn snap_drill_down_active() {
+        let mut app = App::for_test("demo.parquet", make_columns(), make_preview());
+        app.focus = Panel::Data;
+        app.data_row_idx = Some(0);
+        app.data_col_idx = Some(0);
+        // Pretend we drilled down — the tell is `drill_undo` being set,
+        // which the status bar surfaces as "↶ drill-undo: backspace".
+        app.drill_undo = Some(".country, .revenue".into());
+        app.query.insert_str("where .country == \"US\"");
+        let s = render_to_string(&mut app, 100, 24);
+        snap!("drill_down_active", s);
     }
 }

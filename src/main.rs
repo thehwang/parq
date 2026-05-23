@@ -209,7 +209,7 @@ fn register_udfs(conn: &Connection, udfs: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn open_conn() -> Result<Connection> {
+pub(crate) fn open_conn() -> Result<Connection> {
     let conn = Connection::open_in_memory().context("failed to open DuckDB connection")?;
     // Enable cloud httpfs for gs:// / s3:// — duckdb's httpfs is bundled with our build.
     // We swallow errors here because httpfs may already be loaded on some builds.

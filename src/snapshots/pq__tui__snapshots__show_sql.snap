@@ -1,0 +1,28 @@
+---
+source: src/tui.rs
+assertion_line: 3644
+---
+┌ Columns · 3 ─────────────┐┌ Query · 12 ms ───────────────────────────────────────────────────────┐
+│▶ ★ id  BIGINT            ││ try: '.email, .country where .country == "US"' or 'group_by .country │
+│    country  VARCHAR      ││                                                                      │
+│    revenue  DOUBLE       ││                                                                      │
+│                          ││                                                                      │
+│                          │└──────────────────────────────────────────────────────────────────────┘
+│                          │┌ Compiled SQL · press : to collapse ──────────────────────────────────┐
+│                          ││SELECT country, revenue FROM read_parquet('demo.parquet') LIMIT 50    │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          │└──────────────────────────────────────────────────────────────────────┘
+│                          │┌ Data · 3 of 3 rows shown ────────────────────────────────────────────┐
+│                          ││country  revenue                                                      │
+│                          ││US        100.50                                                      │
+└──────────────────────────┘│DE         85.00                                                      │
+┌ Filters · 0 ─────────────┐│JP         63.20                                                      │
+│(none — type `where .col =││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+│                          ││                                                                      │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
+ Tab next │ ␣ toggle │ ⏎ append/drill │ ⌫ undo │ Q exit+print │ Esc quit │ : SQL │ e Explain │ E ANA
