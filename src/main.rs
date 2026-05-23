@@ -28,6 +28,7 @@ use clap::{Parser, Subcommand};
 use duckdb::Connection;
 
 mod cloud;
+mod lineage;
 mod output;
 mod parser;
 mod tui;

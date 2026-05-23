@@ -50,6 +50,7 @@ use ratatui::widgets::{
 use ratatui::Terminal;
 use tui_textarea::TextArea;
 
+use crate::lineage::{self, Lineage};
 use crate::parser;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -248,6 +249,42 @@ struct App<'ta> {
     should_quit: bool,
     /// Set on quit when we want to print the equivalent CLI to stdout.
     print_cli_on_exit: bool,
+
+    // ── v0.6: semantic sync + completion ────────────────────────────────────
+    //
+    /// Token-level lineage of the current query. Recomputed on every
+    /// keystroke (cheap: pure scan of the query string).
+    lineage: Lineage,
+    /// Column-cursor inside the Data panel. None until the user moves with
+    /// ←/→ or h/l; restored from `Some(0)` on first nav so the highlight
+    /// has a deterministic starting place. Used to derive `active_source`
+    /// when the Data panel is focused (column header → source field).
+    data_col_idx: Option<usize>,
+    /// In-flight schema completion. Some(_) iff the cursor is currently
+    /// just after a `.prefix` pattern *and* one or more schema columns
+    /// match. Rendering draws a popup; key dispatch routes Up/Down/Enter
+    /// here instead of forwarding to the textarea.
+    completion: Option<Completion>,
+}
+
+/// Schema-completion popup state. Lives only as long as the user is mid-typing
+/// a column reference — created on every keystroke that lands in `.prefix`
+/// position and torn down as soon as the prefix vanishes (cursor moves out
+/// of the dot-token, prefix matches no schema columns, or popup is dismissed
+/// with Esc).
+#[derive(Debug, Clone)]
+struct Completion {
+    /// What the user has typed after the `.` so far, in original case.
+    /// Used to highlight the matched prefix inside each candidate row.
+    prefix: String,
+    /// Byte offset of the leading `.` in the query buffer — needed when
+    /// inserting a candidate (we replace `.<prefix>` with `.<full>`).
+    dot_byte: usize,
+    /// Schema column names matching the prefix, ordered by relevance:
+    /// exact-prefix matches first (case-insensitive), then substring matches.
+    candidates: Vec<String>,
+    /// Index into `candidates` for the currently highlighted row.
+    selected: usize,
 }
 
 impl<'ta> App<'ta> {
@@ -285,6 +322,9 @@ impl<'ta> App<'ta> {
             flash: None,
             should_quit: false,
             print_cli_on_exit: false,
+            lineage: Lineage::default(),
+            data_col_idx: None,
+            completion: None,
         })
     }
 
@@ -311,7 +351,19 @@ impl<'ta> App<'ta> {
                 let q = self.current_query_text();
                 if q != self.last_compiled {
                     self.preview = run_preview(conn, &self.file, &q);
-                    self.last_compiled = q;
+                    self.last_compiled = q.clone();
+                    // After the data refreshes, the data_col_idx may now
+                    // point past the end of the new headers (e.g. user
+                    // changed projection from 3 cols to 1). Clamp it.
+                    if let Some(i) = self.data_col_idx {
+                        if i >= self.preview.headers.len() {
+                            self.data_col_idx = if self.preview.headers.is_empty() {
+                                None
+                            } else {
+                                Some(self.preview.headers.len() - 1)
+                            };
+                        }
+                    }
                 }
                 self.pending_compile_at = None;
                 // Re-derive column.selected from query text (string-match).
@@ -413,6 +465,95 @@ impl<'ta> App<'ta> {
     fn flash_msg(&mut self, msg: impl Into<String>) {
         self.flash = Some((msg.into(), Instant::now()));
     }
+
+    // ── v0.6 semantic sync helpers ─────────────────────────────────────────
+    //
+    /// Recompute the lineage from the current query buffer. Cheap (single
+    /// pass over the string) — fine to call on every keystroke.
+    fn refresh_lineage(&mut self) {
+        self.lineage = lineage::extract(&self.current_query_text());
+    }
+
+    /// The "active" source column for cross-panel highlighting. Resolved
+    /// from focus + cursor:
+    ///
+    ///   - Query   → byte offset of textarea cursor → lineage.column_at()
+    ///   - Data    → header at data_col_idx → lineage.source_of() (derived
+    ///     aliases like sum_revenue resolve to revenue) or the header
+    ///     itself (plain projections).
+    ///   - Columns → the row currently selected in the Columns list.
+    ///
+    /// Returns None when there's nothing meaningful to highlight (e.g.
+    /// cursor parked in whitespace, no rows yet).
+    fn active_source(&self) -> Option<String> {
+        match self.focus {
+            Panel::Query => {
+                let off = cursor_byte_offset(&self.query);
+                self.lineage.column_at(off).map(|r| r.name.clone())
+            }
+            Panel::Data => {
+                let idx = self.data_col_idx?;
+                let header = self.preview.headers.get(idx)?;
+                if let Some(src) = self.lineage.source_of(header) {
+                    Some(src.to_string())
+                } else {
+                    Some(header.clone())
+                }
+            }
+            Panel::Columns => {
+                let idx = self.column_state.selected()?;
+                self.columns.get(idx).map(|c| c.name.clone())
+            }
+        }
+    }
+
+    /// Recompute the schema-completion popup state from the cursor position.
+    /// Called after every textarea keystroke. Sets `self.completion` to
+    /// `Some(_)` iff:
+    ///   - cursor is positioned just after one or more identifier chars
+    ///   - those chars are immediately preceded by a `.`
+    ///   - at least one schema column matches the typed prefix
+    ///
+    /// We don't fire when the prefix is empty (just typed `.`) on purpose —
+    /// 99% of the time the user wants to see candidates only after they've
+    /// committed at least one letter, otherwise the popup pops up on every
+    /// projection comma and gets in the way.
+    fn refresh_completion(&mut self) {
+        self.completion = compute_completion(&self.query, &self.columns);
+    }
+
+    /// Insert the currently-selected candidate into the query buffer,
+    /// replacing the `.prefix` span. No-op when no completion is active.
+    fn accept_completion(&mut self) {
+        let Some(c) = self.completion.take() else {
+            return;
+        };
+        let Some(pick) = c.candidates.get(c.selected).cloned() else {
+            return;
+        };
+        let full = self.current_query_text();
+        let span_end = c.dot_byte + 1 + c.prefix.len();
+        // Defensive bounds check — `compute_completion` only emits valid spans
+        // for the buffer it observed, but the buffer might shift between calls.
+        if span_end > full.len() {
+            return;
+        }
+        let mut rebuilt = String::with_capacity(full.len() + pick.len());
+        rebuilt.push_str(&full[..c.dot_byte]);
+        rebuilt.push('.');
+        rebuilt.push_str(&pick);
+        rebuilt.push_str(&full[span_end..]);
+        self.replace_query(rebuilt);
+        // Move cursor to right after the inserted name. We do this by
+        // replacing the textarea (set up by replace_query) and then
+        // forward-walking the cursor — tui-textarea has no direct
+        // "set cursor at byte offset", but we can move down/right one
+        // line at a time. For a single-line query (the common case) the
+        // cursor naturally lands at end-of-line which is what we want.
+        // Multi-line queries are rare in the TUI; correctness > polish.
+        self.refresh_lineage();
+        self.schedule_compile();
+    }
 }
 
 // ─── Event handling ──────────────────────────────────────────────────────────
@@ -479,6 +620,43 @@ fn on_key_columns(app: &mut App<'_>, key: KeyEvent) {
 }
 
 fn on_key_query(app: &mut App<'_>, key: KeyEvent) {
+    // ── Completion popup: intercept nav keys when popup is open. ──────────
+    //
+    // We dispatch this BEFORE the textarea hatches so that Up/Down inside
+    // an active popup never accidentally rolls the textarea cursor instead.
+    // Esc dismisses the popup but stays in the Query panel — pressing Esc
+    // again then drops back to Columns (the standard one-Esc-per-level
+    // pattern lazygit/vim users expect).
+    if app.completion.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.completion = None;
+                return;
+            }
+            KeyCode::Up => {
+                if let Some(c) = app.completion.as_mut() {
+                    if c.selected > 0 {
+                        c.selected -= 1;
+                    }
+                }
+                return;
+            }
+            KeyCode::Down => {
+                if let Some(c) = app.completion.as_mut() {
+                    if c.selected + 1 < c.candidates.len() {
+                        c.selected += 1;
+                    }
+                }
+                return;
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                app.accept_completion();
+                return;
+            }
+            _ => {} // fall through — let the textarea handle the keystroke
+        }
+    }
+
     // In Query panel, most keys go to the textarea. Carve out a few escape
     // hatches (Esc to leave focus, Ctrl-Y to copy CLI, Ctrl-Q to quit).
     if key.code == KeyCode::Esc {
@@ -500,9 +678,15 @@ fn on_key_query(app: &mut App<'_>, key: KeyEvent) {
         }
     }
     // Forward to the textarea.
-    if app.query.input(key) {
+    let consumed = app.query.input(key);
+    if consumed {
         app.schedule_compile();
     }
+    // Lineage and completion are derived state — refresh after every event,
+    // including pure cursor-moves (Left/Right/Home/End/...) which don't
+    // schedule a compile but do change which token the cursor sits on.
+    app.refresh_lineage();
+    app.refresh_completion();
 }
 
 fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
@@ -515,7 +699,33 @@ fn on_key_data(app: &mut App<'_>, key: KeyEvent) {
         KeyCode::Char('Y') => app.copy_cli_to_clipboard(),
         KeyCode::Char(':') => app.show_sql = !app.show_sql,
         KeyCode::Char('?') => app.show_help = true,
-        // Arrow keys: scroll the data table in v0.6 (currently shows top 50).
+        // ── v0.6: column-cursor navigation. ───────────────────────────────
+        //
+        // Move data_col_idx left/right to highlight a specific column.
+        // Active column drives semantic sync into the Columns panel —
+        // landing on `sum_revenue` highlights `revenue`, landing on `country`
+        // highlights `country` itself.
+        KeyCode::Right | KeyCode::Char('l') => {
+            let n = app.preview.headers.len();
+            if n == 0 {
+                return;
+            }
+            app.data_col_idx = Some(match app.data_col_idx {
+                Some(i) if i + 1 < n => i + 1,
+                Some(i) => i,
+                None => 0,
+            });
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            let n = app.preview.headers.len();
+            if n == 0 {
+                return;
+            }
+            app.data_col_idx = Some(match app.data_col_idx {
+                Some(0) | None => 0,
+                Some(i) => i - 1,
+            });
+        }
         _ => {}
     }
 }
@@ -559,7 +769,8 @@ fn render(f: &mut ratatui::Frame, app: &mut App<'_>) {
         .constraints(right_constraints)
         .split(body[1]);
 
-    render_query(f, app, right[0]);
+    let query_area = right[0];
+    render_query(f, app, query_area);
     if app.show_sql {
         render_sql(f, app, right[1]);
         render_data(f, app, right[2]);
@@ -568,6 +779,16 @@ fn render(f: &mut ratatui::Frame, app: &mut App<'_>) {
     }
 
     render_status_bar(f, app, outer[1]);
+
+    // ── v0.6: schema completion popup ─────────────────────────────────────
+    //
+    // Drawn above the data table but below the help overlay. We anchor it
+    // to the textarea cursor position so it visually "drops down" from
+    // where the user is typing — same pattern as VS Code / IntelliJ.
+    // Rendered only when the popup is active.
+    if app.completion.is_some() {
+        render_completion(f, app, query_area);
+    }
 
     // Help overlay rendered last so it sits on top of every panel.
     if app.show_help {
@@ -587,14 +808,48 @@ fn focused_style(active: bool) -> Style {
 
 fn render_columns(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
     let active = app.focus == Panel::Columns;
+    // The "active source" comes from whichever panel currently owns focus —
+    // see App::active_source. When the Columns panel is focused this is
+    // just the row the user is hovering; the highlight is most interesting
+    // when focus is in *another* panel (Query/Data) and the user can see
+    // their cursor's lineage land here without leaving the editor.
+    let active_src = app.active_source();
+    // Style for the lineage-linked row. Yellow against any current focus
+    // color works because we only style fg + bold; the focused-list cursor
+    // (` ▶ `) keeps its dark-gray bg, so the two highlights compose.
+    let star_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
     let items: Vec<ListItem> = app
         .columns
         .iter()
         .map(|c| {
-            let mark = if c.selected { "✓ " } else { "  " };
+            let is_active = active_src.as_deref() == Some(c.name.as_str());
+            // Two-char prefix: ★ when this row is the active lineage target,
+            // otherwise the existing ✓ / blank for projection membership.
+            // Keeping it two chars wide means the column names stay
+            // vertically aligned across all rows.
+            let mark = if is_active {
+                "★ "
+            } else if c.selected {
+                "✓ "
+            } else {
+                "  "
+            };
+            let name_style = if is_active {
+                star_style
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            let mark_style = if is_active {
+                star_style
+            } else {
+                Style::default().fg(Color::Green)
+            };
             let line = Line::from(vec![
-                Span::raw(mark),
-                Span::styled(&c.name, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(mark, mark_style),
+                Span::styled(&c.name, name_style),
                 Span::raw("  "),
                 Span::styled(&c.ty, Style::default().fg(Color::DarkGray)),
             ]);
@@ -632,6 +887,32 @@ fn render_query(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
             .border_style(focused_style(active))
             .title(title),
     );
+
+    // ── v0.6: highlight every reference to the active source column ──────
+    //
+    // tui-textarea exposes a builtin search facility — we abuse it here as
+    // a "highlight all matches" channel. Pattern is `\.<name>\b` so we
+    // catch `.country` but not `.country_code`, and we don't accidentally
+    // match a literal substring of an unrelated identifier. Empty pattern
+    // clears the highlight.
+    let highlight_pattern = match app.active_source() {
+        Some(name) if !name.is_empty() => format!(r"\.{}\b", regex_escape(&name)),
+        _ => String::new(),
+    };
+    if let Err(e) = app.query.set_search_pattern(&highlight_pattern) {
+        // tui-textarea returns an error only on invalid regex — our pattern
+        // is escaped so this should never trigger. Stuff a flash for the
+        // unlikely case someone names a column with a regex metachar
+        // we missed.
+        app.flash_msg(format!("highlight pattern err: {e}"));
+    }
+    app.query.set_search_style(
+        Style::default()
+            .bg(Color::Rgb(80, 70, 0)) // muted yellow that survives both
+            .fg(Color::Yellow) // light + dark terminals
+            .add_modifier(Modifier::BOLD),
+    );
+
     // Cursor styling reflects focus. tui-textarea draws the cursor itself
     // (we never call f.set_cursor_position) — without an explicit style the
     // default REVERSED modifier collapses to invisible against the
@@ -652,6 +933,24 @@ fn render_query(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
         app.query.set_cursor_line_style(Style::default());
     }
     f.render_widget(&app.query, area);
+}
+
+/// Minimal regex escaper for column names. tui-textarea's search uses the
+/// `regex` crate, so we escape any byte that's a metachar. We don't pull in
+/// regex::escape because that crate isn't a direct dep yet — replicating the
+/// 14 escape chars by hand is trivial and avoids a transitive surprise.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn render_sql(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
@@ -724,17 +1023,54 @@ fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
         })
         .collect();
 
+    // ── v0.6: which column should glow? ──────────────────────────────────
+    //
+    // Two highlight inputs combine here:
+    //   1. data_col_idx: explicit column-cursor (Data panel has focus, user
+    //      navigated with ←/→). Always wins when set.
+    //   2. active_source: lineage from another panel. When the Query cursor
+    //      sits on `.revenue`, the Data panel should highlight `revenue` AND
+    //      any derived column produced *from* revenue (sum_revenue, etc.).
+    //
+    // We compute one set of "lit" column indices and apply the same style
+    // to both header cell and body cells of those columns.
+    let active_src = app.active_source();
+    let mut lit: Vec<bool> = vec![false; ncols];
+    if let Some(idx) = app.data_col_idx {
+        if idx < ncols {
+            lit[idx] = true;
+        }
+    }
+    if let Some(src) = active_src.as_deref() {
+        for (i, h) in app.preview.headers.iter().enumerate() {
+            // Direct match: header IS the source column.
+            if h == src {
+                lit[i] = true;
+                continue;
+            }
+            // Derived match: header is an alias whose source column matches.
+            if app.lineage.source_of(h) == Some(src) {
+                lit[i] = true;
+            }
+        }
+    }
+    let lit_header_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let lit_cell_style = Style::default().bg(Color::Rgb(60, 50, 0)); // muted gold
+
     let header = Row::new(app.preview.headers.iter().enumerate().map(|(i, h)| {
-        let mut style = Style::default().add_modifier(Modifier::BOLD);
-        if numeric[i] {
-            style = style.fg(Color::Cyan);
-        }
-        let cell = Cell::from(h.clone()).style(style);
-        if numeric[i] {
-            cell.style(style)
+        let style = if lit[i] {
+            lit_header_style
         } else {
-            cell
-        }
+            let mut s = Style::default().add_modifier(Modifier::BOLD);
+            if numeric[i] {
+                s = s.fg(Color::Cyan);
+            }
+            s
+        };
+        Cell::from(h.clone()).style(style)
     }));
 
     let rows: Vec<Row> = app
@@ -751,7 +1087,12 @@ fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
                 } else {
                     truncated
                 };
-                Cell::from(text)
+                let cell = Cell::from(text);
+                if lit[i] {
+                    cell.style(lit_cell_style)
+                } else {
+                    cell
+                }
             }))
         })
         .collect();
@@ -804,11 +1145,21 @@ fn looks_numeric(s: &str) -> bool {
 }
 
 fn render_status_bar(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
+    // Status bar swaps between three contexts:
+    //   1. flash message (e.g. "Y → CLI: …") — wins for 3s
+    //   2. completion popup help — when popup is open
+    //   3. default panel-key cheatsheet — otherwise
+    //
+    // The completion-mode hint exists because the regular bar's keys
+    // (Tab, Enter, ←/→) get rebound while the popup is up; surfacing the
+    // override avoids the "why didn't Enter quit?" confusion.
     let default_help =
         " Tab next │ ␣ toggle col │ ⏎ append │ Q exit+print │ Esc/q quit │ : SQL │ ? help ";
-    let text = match &app.flash {
-        Some((msg, _)) => msg.clone(),
-        None => default_help.to_string(),
+    let completion_help = " ↑↓ pick · ⏎/Tab insert · Esc cancel · keep typing to filter ";
+    let text = match (&app.flash, app.completion.is_some()) {
+        (Some((msg, _)), _) => msg.clone(),
+        (None, true) => completion_help.to_string(),
+        (None, false) => default_help.to_string(),
     };
     let p = Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(p, area);
@@ -888,6 +1239,113 @@ fn find_word(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
+/// Render the schema-completion popup right under the textarea cursor. We
+/// keep the popup small (max 8 rows, max 32 cols wide) and clamp it to stay
+/// inside the screen — if the cursor is near the bottom of the query area,
+/// shift the popup down by one row so it doesn't overlap the cursor.
+fn render_completion(f: &mut ratatui::Frame, app: &App<'_>, query_area: Rect) {
+    let Some(comp) = &app.completion else {
+        return;
+    };
+    if comp.candidates.is_empty() {
+        return;
+    }
+
+    // Compute the popup's screen anchor. tui-textarea reports cursor
+    // (row, col) in 0-based char coords inside the textarea content; the
+    // textarea's visible content begins at (query_area.x + 1, query_area.y + 1)
+    // because of the 1-cell border.
+    let (cur_row, cur_col) = app.query.cursor();
+    let anchor_x = query_area
+        .x
+        .saturating_add(1)
+        .saturating_add(cur_col as u16);
+    let anchor_y = query_area
+        .y
+        .saturating_add(1)
+        .saturating_add(cur_row as u16)
+        .saturating_add(1); // one row below the cursor
+
+    let n = comp.candidates.len().min(8) as u16;
+    // Width: longest candidate + 2 cells padding, capped at 32. Min 16 so
+    // the title isn't truncated.
+    let max_label = comp
+        .candidates
+        .iter()
+        .take(8)
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let popup_w = max_label.saturating_add(4).clamp(16, 32);
+    let popup_h = n.saturating_add(2); // +2 for borders
+
+    // Clamp to screen so we never paint outside the terminal.
+    let screen = f.area();
+    let x = anchor_x.min(screen.x + screen.width.saturating_sub(popup_w));
+    let y = anchor_y.min(screen.y + screen.height.saturating_sub(popup_h));
+    let popup = Rect::new(x, y, popup_w, popup_h);
+    f.render_widget(Clear, popup);
+
+    let prefix_lower = comp.prefix.to_ascii_lowercase();
+    let items: Vec<ListItem> = comp
+        .candidates
+        .iter()
+        .enumerate()
+        .take(8)
+        .map(|(i, name)| {
+            let is_sel = i == comp.selected;
+            // Highlight the matched prefix in yellow inside each row, so the
+            // user sees *why* the candidate is in the list.
+            let lower = name.to_ascii_lowercase();
+            let mut spans: Vec<Span> = Vec::with_capacity(3);
+            if let Some(pos) = lower.find(&prefix_lower) {
+                let end = pos + prefix_lower.len();
+                if pos > 0 {
+                    spans.push(Span::raw(name[..pos].to_string()));
+                }
+                spans.push(Span::styled(
+                    name[pos..end].to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                if end < name.len() {
+                    spans.push(Span::raw(name[end..].to_string()));
+                }
+            } else {
+                spans.push(Span::raw(name.clone()));
+            }
+            let line = Line::from(spans);
+            let mut item = ListItem::new(line);
+            if is_sel {
+                item = item.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            item
+        })
+        .collect();
+
+    let title = if comp.candidates.len() > 8 {
+        format!(
+            " .{} · {} matches (showing 8) ",
+            comp.prefix,
+            comp.candidates.len()
+        )
+    } else {
+        format!(" .{} · {} matches ", comp.prefix, comp.candidates.len())
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(title),
+    );
+    f.render_widget(list, popup);
+}
+
 fn render_help(f: &mut ratatui::Frame, full: Rect) {
     let area = centered_rect(78, 80, full);
     f.render_widget(Clear, area);
@@ -930,6 +1388,16 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
             Span::raw("               force quit (works through any modal)"),
         ]),
         Line::from(""),
+        Line::from(Span::styled("Semantic sync (v0.6)", bold)),
+        Line::from(Span::styled(
+            "  Cursor on .col / sum_col → Columns highlights ★ revenue, etc.",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Type `.co` in Query → schema completion popup (⏎/Tab to accept)",
+            dim,
+        )),
+        Line::from(""),
         Line::from(Span::styled("Columns panel", bold)),
         Line::from(vec![
             Span::styled("  ↑ ↓ / k j", key),
@@ -942,6 +1410,12 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
         Line::from(vec![
             Span::styled("  Enter", key),
             Span::raw("                append column to projection (no toggle off)"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Data panel", bold)),
+        Line::from(vec![
+            Span::styled("  ← → / h l", key),
+            Span::raw("             move column-cursor (lights up source field)"),
         ]),
         Line::from(""),
         Line::from(Span::styled("Query panel — DSL grammar quick ref", bold)),
@@ -1087,6 +1561,119 @@ fn teardown_terminal(t: &mut Tui) -> Result<()> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Convert a tui-textarea cursor (row, col) into a byte offset into the
+/// joined query string (`lines().join("\n")`). The textarea reports `col`
+/// in characters, so we sum char widths up to that column for the cursor's
+/// row, plus full lengths (+1 for newline) for each preceding row.
+///
+/// Used to feed the cursor position to `Lineage::column_at`.
+fn cursor_byte_offset(ta: &TextArea<'_>) -> usize {
+    let (row, col) = ta.cursor();
+    let lines = ta.lines();
+    let mut off = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if i == row {
+            off += line.chars().take(col).map(|c| c.len_utf8()).sum::<usize>();
+            return off;
+        }
+        off += line.len() + 1;
+    }
+    // Cursor row past the buffer (shouldn't happen, but be lenient).
+    off
+}
+
+/// Decide whether the cursor is currently parked just after `.<ident_chars>`,
+/// and if so, what schema columns match. Returns `None` when there's nothing
+/// to complete (cursor not after a `.ident` token, or zero schema matches).
+///
+/// Triggering rules (intentionally conservative — we'd rather miss a
+/// completion opportunity than have the popup flash open spuriously):
+///   - cursor must be at the *end* of an identifier run (one byte past the
+///     last word char), not in the middle of one — completing inside an
+///     existing word would force an awkward "where do I splice the rest?"
+///     decision;
+///   - the byte at `cursor - prefix_len - 1` must be `.`;
+///   - the prefix must contain at least one char (no popup on bare `.`);
+///   - at least one schema column must match.
+fn compute_completion(ta: &TextArea<'_>, columns: &[ColumnInfo]) -> Option<Completion> {
+    let buf = ta.lines().join("\n");
+    let off = cursor_byte_offset(ta);
+    if off == 0 || off > buf.len() {
+        return None;
+    }
+    let bytes = buf.as_bytes();
+
+    // Refuse to fire when we're in the *middle* of an identifier — the next
+    // byte (if any) would be a word char.
+    if off < bytes.len() {
+        let next = bytes[off];
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return None;
+        }
+    }
+
+    // Walk back from cursor over ident chars to find the prefix start.
+    let mut prefix_start = off;
+    while prefix_start > 0 {
+        let b = bytes[prefix_start - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            prefix_start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Require a `.` immediately before the prefix.
+    if prefix_start == 0 || bytes[prefix_start - 1] != b'.' {
+        return None;
+    }
+    let dot_byte = prefix_start - 1;
+    let prefix = &buf[prefix_start..off];
+    if prefix.is_empty() {
+        return None;
+    }
+
+    // We don't want completion to fire on a *qualified* dot like `.a.col`
+    // (where the user has already typed `.a` and is in the middle of `.col`).
+    // Heuristic: if the byte before the leading `.` is itself an ident byte,
+    // we're in a `.x.y` chain — bail.
+    if dot_byte > 0 {
+        let pb = bytes[dot_byte - 1];
+        if pb.is_ascii_alphanumeric() || pb == b'_' {
+            return None;
+        }
+    }
+
+    // Score = (matches_prefix?, name) so prefix matches sort first; among
+    // those, alphabetical. Substring matches are a secondary tier.
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut prefix_hits: Vec<&str> = Vec::new();
+    let mut substr_hits: Vec<&str> = Vec::new();
+    for c in columns {
+        let cl = c.name.to_ascii_lowercase();
+        if cl.starts_with(&prefix_lower) {
+            prefix_hits.push(&c.name);
+        } else if cl.contains(&prefix_lower) {
+            substr_hits.push(&c.name);
+        }
+    }
+    if prefix_hits.is_empty() && substr_hits.is_empty() {
+        return None;
+    }
+    prefix_hits.sort_unstable();
+    substr_hits.sort_unstable();
+    let mut candidates: Vec<String> = Vec::with_capacity(prefix_hits.len() + substr_hits.len());
+    candidates.extend(prefix_hits.iter().map(|s| s.to_string()));
+    candidates.extend(substr_hits.iter().map(|s| s.to_string()));
+
+    Some(Completion {
+        prefix: prefix.to_string(),
+        dot_byte,
+        candidates,
+        selected: 0,
+    })
+}
+
 /// Single-quote a string for shell consumption — escape embedded single quotes
 /// the POSIX way: `it's` → `'it'\''s'`.
 fn shell_quote(s: &str) -> String {
@@ -1198,5 +1785,133 @@ mod tests {
         assert!(!looks_numeric(""));
         // No digit at all → not numeric, even if all chars are punctuation.
         assert!(!looks_numeric("--"));
+    }
+
+    // ── v0.6 helpers: cursor offset + completion popup logic ────────────
+    //
+    // We can't easily unit-test the full TUI render path without a virtual
+    // terminal, but the *logic* that decides what to highlight and what to
+    // suggest is pure on a TextArea + ColumnInfo input — which is exactly
+    // what these tests pin.
+
+    fn ta_with(text: &str, cursor_byte: usize) -> TextArea<'static> {
+        // Build a TextArea whose buffer is `text` and cursor lives at the
+        // char that starts at `cursor_byte`. We move the cursor by inserting
+        // chars one at a time and then rewinding — `tui-textarea` exposes
+        // `move_cursor(CursorMove)` but no direct "set to byte offset", so
+        // we approximate with insert-from-empty: insert prefix → snapshot
+        // cursor → insert suffix.
+        use tui_textarea::CursorMove;
+        let mut ta = TextArea::default();
+        ta.insert_str(text);
+        // Walk back to the beginning, then forward to cursor_byte.
+        ta.move_cursor(CursorMove::Top);
+        ta.move_cursor(CursorMove::Head);
+        let mut walked = 0usize;
+        for c in text.chars() {
+            if walked >= cursor_byte {
+                break;
+            }
+            // Forward = right within line; \n traversal handled by Down+Head
+            // for simplicity. (Our tests use single-line buffers.)
+            assert!(c != '\n', "test helper only supports single-line input");
+            ta.move_cursor(CursorMove::Forward);
+            walked += c.len_utf8();
+        }
+        ta
+    }
+
+    fn cols(names: &[&str]) -> Vec<ColumnInfo> {
+        names
+            .iter()
+            .map(|n| ColumnInfo {
+                name: (*n).into(),
+                ty: "VARCHAR".into(),
+                selected: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cursor_byte_offset_single_line() {
+        let ta = ta_with("group_by .country", 12);
+        assert_eq!(cursor_byte_offset(&ta), 12);
+    }
+
+    #[test]
+    fn completion_fires_on_dot_prefix() {
+        let cs = cols(&["country", "region", "revenue", "age"]);
+        // Cursor at end of `.co` — should match `country`.
+        let ta = ta_with(".co", 3);
+        let c = compute_completion(&ta, &cs).expect("expected popup");
+        assert_eq!(c.prefix, "co");
+        assert_eq!(c.dot_byte, 0);
+        // Prefix matches first; "country" is the only one starting with "co".
+        assert_eq!(c.candidates, vec!["country".to_string()]);
+        assert_eq!(c.selected, 0);
+    }
+
+    #[test]
+    fn completion_prefix_then_substring() {
+        // `co_owner` and `country` start with `co` (prefix tier);
+        // `discount` contains `co` mid-word (substring tier);
+        // `region` does not contain `co` at all (excluded).
+        let cs = cols(&["country", "discount", "co_owner", "region"]);
+        let ta = ta_with(".co", 3);
+        let c = compute_completion(&ta, &cs).expect("expected popup");
+        // Prefix tier first (alphabetical), then substring tier.
+        assert_eq!(
+            c.candidates,
+            vec![
+                "co_owner".to_string(),
+                "country".to_string(),
+                "discount".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_silent_on_empty_prefix() {
+        // Just typed `.` with no following letters. We *don't* show the
+        // popup here on purpose (see compute_completion docstring).
+        let cs = cols(&["country", "region"]);
+        let ta = ta_with(".", 1);
+        assert!(compute_completion(&ta, &cs).is_none());
+    }
+
+    #[test]
+    fn completion_silent_inside_word() {
+        // `.country` with the cursor in the middle (after `.cou`). The
+        // next byte is `n` → still inside an identifier → bail.
+        let cs = cols(&["country", "region"]);
+        let ta = ta_with(".country", 4);
+        assert!(compute_completion(&ta, &cs).is_none());
+    }
+
+    #[test]
+    fn completion_silent_on_qualified_dot_chain() {
+        // `.a.co` — the leading `.` of `co` is part of a `.a.co` chain.
+        // We don't try to complete table-qualified column names because
+        // the schema only knows the local-side column list.
+        let cs = cols(&["country", "region"]);
+        let ta = ta_with(".a.co", 5);
+        assert!(compute_completion(&ta, &cs).is_none());
+    }
+
+    #[test]
+    fn completion_silent_when_no_match() {
+        let cs = cols(&["country", "region"]);
+        // `.zz` matches nothing → no popup.
+        let ta = ta_with(".zz", 3);
+        assert!(compute_completion(&ta, &cs).is_none());
+    }
+
+    #[test]
+    fn regex_escape_handles_metachars() {
+        // Sanity check the homegrown escaper used for highlight pattern.
+        assert_eq!(regex_escape("country"), "country");
+        assert_eq!(regex_escape("a.b"), r"a\.b");
+        assert_eq!(regex_escape("price$"), r"price\$");
+        assert_eq!(regex_escape("col[0]"), r"col\[0\]");
     }
 }

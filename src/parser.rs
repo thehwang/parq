@@ -66,7 +66,7 @@ pub fn source_clause(file: &str) -> String {
 /// When `<col>` is a qualified name like `b.amount`, the naive concatenation
 /// `sum_b.amount` is invalid SQL — DuckDB parses the dot as a struct accessor.
 /// Replace any non-identifier character with `_` to keep the alias parseable.
-fn alias_safe(col: &str) -> String {
+pub(crate) fn alias_safe(col: &str) -> String {
     col.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {

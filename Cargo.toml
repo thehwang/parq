@@ -28,7 +28,11 @@ colored = "2.1"
 # pinned together until tui-textarea ships a ratatui 0.30 release.
 ratatui = "0.29"
 crossterm = "0.28"
-tui-textarea = "0.7"
+# `search` feature gates set_search_pattern/set_search_style — used by the
+# Query panel's "highlight every reference to the active source column"
+# (semantic sync, v0.6). It pulls in the `regex` crate transitively, but
+# we already escape user input in regex_escape() so the surface is safe.
+tui-textarea = { version = "0.7", features = ["search"] }
 
 [profile.release]
 opt-level = 3
