@@ -926,11 +926,15 @@ fn render_columns(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
     // when focus is in *another* panel (Query/Data) and the user can see
     // their cursor's lineage land here without leaving the editor.
     let active_src = app.active_source();
-    // Style for the lineage-linked row. Yellow against any current focus
-    // color works because we only style fg + bold; the focused-list cursor
-    // (` ▶ `) keeps its dark-gray bg, so the two highlights compose.
+    // Style for the lineage-linked row.
+    //
+    // We deliberately use 24-bit RGB gold (255,215,0) instead of the named
+    // `Color::Yellow`: the latter resolves to ANSI 16-color slot 3, which
+    // most terminal palettes render as a muted brown that's nearly
+    // indistinguishable from `Modifier::BOLD` on a default white fg. The
+    // RGB form survives any palette and reads as unmistakably yellow.
     let star_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(Color::Rgb(255, 215, 0))
         .add_modifier(Modifier::BOLD);
 
     let items: Vec<ListItem> = app
@@ -1018,10 +1022,15 @@ fn render_query(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
         // we missed.
         app.flash_msg(format!("highlight pattern err: {e}"));
     }
+    // Same RGB-vs-named-color rationale as the Columns ★ row — `Color::Yellow`
+    // renders muted on most palettes. We pair a deep-olive bg with a bright
+    // gold fg so matched references read as a "highlighter swipe" even when
+    // the user's cursor parks on top of one (the cursor's own yellow bg sits
+    // above this and still wins by being noticeably brighter).
     app.query.set_search_style(
         Style::default()
-            .bg(Color::Rgb(80, 70, 0)) // muted yellow that survives both
-            .fg(Color::Yellow) // light + dark terminals
+            .bg(Color::Rgb(120, 100, 0))
+            .fg(Color::Rgb(255, 215, 0))
             .add_modifier(Modifier::BOLD),
     );
 
@@ -1322,17 +1331,31 @@ fn render_filters(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
 /// for the read-only Filters panel. Lossy by design — we don't try to
 /// reconstruct the full parser; just pull each filter expression out with
 /// enough fidelity that users see what conditions are active.
+///
+/// Tolerant of mid-typing buffers: when the user has just typed the keyword
+/// itself (e.g. `.country, .revenue where`) and nothing follows, we emit no
+/// filter rather than panicking on an out-of-bounds slice.
 fn extract_filters(q: &str) -> Vec<String> {
     let mut out = Vec::new();
     for stage in q.split('|').map(str::trim) {
         if stage.is_empty() {
             continue;
         }
-        for kw in &["where ", "having "] {
-            if let Some(pos) = find_word(stage, kw.trim_end()) {
-                let expr = stage[pos + kw.len()..].trim().to_string();
+        for kw in &["where", "having"] {
+            if let Some(pos) = find_word(stage, kw) {
+                // Slice past the keyword itself. `pos + kw.len()` lands one
+                // byte past the keyword's last char — always a valid index
+                // because `find_word` returned it. Note: don't reuse the
+                // old `kw + " "` length here — that crashed when the user
+                // typed a bare `where` with no trailing space.
+                let after_kw = pos + kw.len();
+                let expr = stage
+                    .get(after_kw..)
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string();
                 if !expr.is_empty() {
-                    let prefix = if *kw == "having " { "(having) " } else { "" };
+                    let prefix = if *kw == "having" { "(having) " } else { "" };
                     out.push(format!("{prefix}{expr}"));
                 }
                 break;
@@ -1969,6 +1992,17 @@ mod tests {
         // Bare-word "whereabouts" must not match `where` — find_word's
         // after_ok check ensures we only match on whitespace/end after.
         assert!(extract_filters(".whereabouts").is_empty());
+    }
+
+    #[test]
+    fn extract_filters_bare_keyword_at_end_does_not_panic() {
+        // Regression: user typing `.country, .revenue where ` (or just
+        // `... where`) used to slice `stage[pos + "where ".len()..]` which
+        // overran the buffer when nothing followed the keyword. The
+        // tolerant slice now returns an empty expression, which we skip.
+        assert!(extract_filters(".country, .revenue where").is_empty());
+        assert!(extract_filters(".country, .revenue where ").is_empty());
+        assert!(extract_filters("group_by .x | having").is_empty());
     }
 
     #[test]
