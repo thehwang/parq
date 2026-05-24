@@ -6,11 +6,11 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.9 — `pq` becomes a real shell primitive.** Pipe parquet directly: `cat f.parquet | pq -` and `aws s3 cp s3://x/y - | pq -` now Just Work — pq detects a non-seekable stdin and spools to a tempfile so DuckDB's footer-trailer reader is happy. Pair with `-i ndjson` / `-i csv` to chain stages without a temp file: `pq f.parquet '.country | to_json' | pq -i ndjson - 'group_by .country | count'`.
+> **New in v0.10 — first-class nested schema support.** `LIST` / `STRUCT` / `MAP` columns now render as proper JSON (was Rust-Debug strings) and the DSL grew jq-style sugar: `.tags[0]`, `.tags[]`, `.events[0].kind`, `.metadata["plan"]`, `len(.tags)`, `keys(.metadata)`. JSON output now preserves projection order (was alphabetical).
 >
-> _v0.8: async `EXPLAIN ANALYZE` (`E` returns instantly, `Esc` cancels), persisted query history (`Ctrl-↑/Ctrl-↓`), snapshot + VHS tests. v0.7: Homebrew tap (`brew install thehwang/parq/pq`). v0.6: semantic sync, schema completion, drill-down, Explain panel. v0.5: the TUI itself._
+> _v0.9.1: `to_ndjson` / `to_jsonl` aliases. v0.9: stdin auto-spool (`cat f.parquet | pq -`) + `-i ndjson` chains. v0.8: async `EXPLAIN ANALYZE`, persisted query history. v0.7: Homebrew tap. v0.6: semantic sync + Explain panel. v0.5: the TUI._
 >
-> Already on Homebrew? `brew upgrade pq` to grab v0.9.
+> Already on Homebrew? `brew update && brew upgrade pq` to grab v0.10.
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -394,6 +394,54 @@ filter_expr  := <DuckDB SQL fragment>            -- with sugar:
                   ==      → =
                   !=      → <>
                   bare .col → col
+```
+
+## Nested schema (v0.10)
+
+Parquet's everyday nested types (`LIST`, `STRUCT`, `MAP`) are now first
+class. The renderer emits proper JSON for them, and the DSL gained
+jq-style bracket sugar so you don't have to drop into raw SQL:
+
+| pq DSL | DuckDB SQL | Notes |
+|---|---|---|
+| `.user.name` | `user.name` | STRUCT field — already worked, kept naming |
+| `.tags[0]` | `tags[1]` | LIST index — pq accepts jq's 0-indexed, translates to DuckDB's 1-indexed |
+| `.tags[-1]` | `tags[-1]` | last element (DuckDB native) |
+| `.tags[]` | `UNNEST(tags) AS tags` | row explosion — projection only |
+| `.events[0].kind` | `events[1].kind` | LIST&lt;STRUCT&gt; — index then field |
+| `.metadata["plan"]` | `element_at(metadata, 'plan')[1]` | MAP value lookup |
+| `len(.tags)` | `len(tags)` | length |
+| `keys(.metadata)` | `map_keys(metadata)` | MAP keys |
+| `values(.metadata)` | `map_values(metadata)` | MAP values |
+
+```bash
+# Real example — events.parquet has events: LIST<STRUCT(kind, amount)>
+pq events.parquet '.user_id, .events[0].kind, .events[0].amount'
+# {"user_id":1,"events_0_kind":"click","events_0_amount":1.0}
+
+# Row-explode an array column
+pq events.parquet '.user_id, .events[]'
+# {"user_id":1,"events":{"kind":"click","amount":1.0}}
+# {"user_id":1,"events":{"kind":"buy","amount":9.0}}
+
+# MAP key access in WHERE
+pq users.parquet 'where .metadata["plan"] == "pro"'
+
+# Nested types chain through ndjson cleanly
+pq events.parquet '.user_id, .events | to_json' \
+  | pq -i ndjson - 'where len(.events) > 0 | count'
+```
+
+JSON output preserves projection order (the JSON object keys appear in
+the order you wrote in the SELECT list, top-level and nested) — useful
+when downstream code makes positional assumptions.
+
+For anything `pq`'s sugar doesn't cover (correlated UNNEST, list
+comprehensions, complex MAP filters), the raw SQL escape hatch is
+always available:
+
+```bash
+pq events.parquet 'SELECT user_id, list_filter(events, e -> e.amount > 5) AS big FROM FILE'
 ```
 
 ## Shell primitive (v0.9)

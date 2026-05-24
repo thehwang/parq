@@ -123,6 +123,20 @@ fn final_col_name(expr: &str) -> String {
     expr.rsplit('.').next().unwrap_or(expr).trim().to_string()
 }
 
+/// Inverse of `final_col_name` — strip the `AS alias` suffix and return the
+/// raw column expression. Used by GROUP BY emission, where DuckDB rejects
+/// `expr AS alias` (only the expression OR the alias name is legal there).
+/// Case-insensitive on the ` AS ` literal because users sometimes type it
+/// in upper case via the raw-SQL escape hatch.
+fn strip_as_alias(expr: &str) -> String {
+    let lower = expr.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind(" as ") {
+        expr[..idx].trim().to_string()
+    } else {
+        expr.trim().to_string()
+    }
+}
+
 /// Heuristic: does the path contain at least one `name=value` directory segment?
 /// We deliberately scan just the path bytes — works for local paths, gs://, s3://.
 fn looks_like_hive_partition(path: &str) -> bool {
@@ -344,8 +358,17 @@ impl QueryPlan {
             sql.push_str(&self.filters.join(" AND "));
         }
         if !self.group_by.is_empty() {
+            // GROUP BY can take either the bare expression OR the alias,
+            // but NOT `expr AS alias` — that's a parse error in DuckDB.
+            // self.group_by stores the SELECT-list form (with alias) so
+            // that `final_col_name` and the outer SELECT keep working;
+            // strip the alias here for the GROUP BY emission. Examples:
+            //   `country`                          → `country`
+            //   `payer_zipped[1].type_coverage AS payer_zipped_0_type_coverage`
+            //                                      → `payer_zipped[1].type_coverage`
             sql.push_str(" GROUP BY ");
-            sql.push_str(&self.group_by.join(", "));
+            let bare: Vec<String> = self.group_by.iter().map(|g| strip_as_alias(g)).collect();
+            sql.push_str(&bare.join(", "));
         }
         if !self.havings.is_empty() {
             sql.push_str(" HAVING ");
@@ -522,14 +545,22 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
         ("max", Aggregate::Max),
     ] {
         if let Some(rest) = strip_keyword(s, kw) {
-            let col = strip_dot(rest);
-            if col.is_empty() {
+            let raw = rest.trim();
+            if raw.is_empty() {
                 return Err(anyhow!(
                     "`{}` requires a column (e.g. `{} .revenue`)",
                     kw,
                     kw
                 ));
             }
+            // v0.10: aggregate target can be a nested path —
+            // `sum .events[0].amount`, `avg .user.age`. Falls back to
+            // `strip_dot` so plain `sum .revenue` still compiles.
+            let col = if raw.starts_with('.') {
+                path_to_sql(raw).unwrap_or_else(|_| strip_dot(raw))
+            } else {
+                strip_dot(raw)
+            };
             plan.aggregates.push(ctor(col));
             return Ok(());
         }
@@ -557,12 +588,24 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
         return Ok(());
     }
 
-    // limit N / head N
+    // limit N / head N — also accept the unix flag forms `head -n 5`
+    // and `head -5` because shell-pipe muscle memory will reach for
+    // them (the error message used to say "got `-n 3`" which felt
+    // hostile when the user is just typing what `head` always took).
     if let Some(rest) = strip_keyword(s, "limit").or_else(|| strip_keyword(s, "head")) {
-        let n: usize = rest
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("`limit/head` needs an integer, got `{}`", rest.trim()))?;
+        let arg = rest.trim();
+        let cleaned = arg
+            .strip_prefix("-n")
+            .map(|x| x.trim())
+            .or_else(|| arg.strip_prefix('-'))
+            .unwrap_or(arg)
+            .trim();
+        let n: usize = cleaned.parse().map_err(|_| {
+            anyhow!(
+                "`limit/head` needs a non-negative integer (e.g. `head 5` or `limit 5`), got `{}`",
+                arg
+            )
+        })?;
         plan.limit = Some(n);
         return Ok(());
     }
@@ -732,17 +775,339 @@ fn strip_dot(s: &str) -> String {
     s.trim().trim_start_matches('.').trim().to_string()
 }
 
-/// Split "col" / ".col" / "col asc" / ".col desc" — returns (col_name, ascending)
+// ─── Path tokenizer (v0.10) ──────────────────────────────────────────────────
+//
+// jq-style path syntax with bracket sugar for nested types:
+//
+//   .foo                  → foo                     plain identifier
+//   .foo.bar              → foo.bar                 STRUCT field access
+//   .foo[0]               → foo[1]                  LIST index (jq 0-idx → DuckDB 1-idx)
+//   .foo[-1]              → foo[-1]                 last element (DuckDB native)
+//   .foo[]                → UNNEST(foo)             LIST explosion (projection only)
+//   .foo["plan"]          → element_at(foo,'plan')[1]  MAP value access
+//   .foo['plan']          → element_at(foo,'plan')[1]  same with single quotes
+//   .foo.bar[0]           → foo.bar[1]              chained
+//   .foo[0].bar           → foo[1].bar              index-then-struct
+//
+// Limitations (v0.10): bare `[]` is only meaningful as a top-level
+// projection — `.events[].kind` requires re-stating as a CTE / raw SQL.
+// We could add list_transform desugaring later, but the projection case
+// covers ~80% of analyst use.
+//
+// We intentionally implement this as a hand-rolled tokenizer rather than
+// reaching for a parser combinator crate — the grammar is small enough
+// that explicit code is easier to read and audit.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathSegment {
+    /// Plain identifier or struct field. `head` distinguishes the first
+    /// segment (no leading `.` in SQL) from `.bar` continuations.
+    Field(String),
+    /// `[N]` — DuckDB list index. Stored already 1-converted from jq's
+    /// 0-indexed input. Negative indices pass through unchanged.
+    Index(i64),
+    /// `[]` — list explosion. Must be the LAST segment.
+    Unnest,
+    /// `["k"]` / `['k']` — MAP key lookup.
+    MapKey(String),
+}
+
+/// Translate a single pq DSL path expression into DuckDB SQL.
+pub(crate) fn path_to_sql(path: &str) -> Result<String> {
+    let segments = tokenize_path(path)?;
+    render_path(&segments)
+}
+
+/// Generate a clean SQL alias for a tokenized path. DuckDB's auto-naming
+/// would emit `(events[1]).amount` or `element_at(metadata, 'plan')[1]` —
+/// fine internally, hostile in JSON output and downstream chains. We
+/// derive a snake_case alias from the path segments so users see
+/// `events_0_amount` / `metadata_plan` instead.
+///
+/// Only fires when the path contains brackets — plain struct dot paths
+/// (`.user.email`) keep DuckDB's default auto-naming (`email`) so we
+/// don't break the historical contract that `pq f '.user.email'`
+/// produces a JSON key called `email`.
+pub(crate) fn alias_for_path(path: &str) -> Option<String> {
+    let segments = tokenize_path(path).ok()?;
+    if segments.len() == 1 {
+        // Plain `.foo` — DuckDB names it `foo`, which is already clean.
+        return None;
+    }
+    // No brackets → pure struct path, defer to DuckDB's auto-naming for
+    // backward compat (`.user.email` → `email`, not `user_email`).
+    let has_bracket = segments.iter().any(|s| {
+        matches!(
+            s,
+            PathSegment::Index(_) | PathSegment::MapKey(_) | PathSegment::Unnest
+        )
+    });
+    if !has_bracket {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(segments.len());
+    for seg in &segments {
+        match seg {
+            PathSegment::Field(name) => parts.push(name.clone()),
+            PathSegment::Index(n) => {
+                // Translate back to jq's 0-indexed form for human-friendly
+                // aliases. `tags[1]` (DuckDB) was `.tags[0]` (jq) — surface
+                // the latter spelling.
+                let display = if *n > 0 { *n - 1 } else { *n };
+                parts.push(if display < 0 {
+                    format!("neg{}", -display)
+                } else {
+                    display.to_string()
+                });
+            }
+            PathSegment::MapKey(k) => parts.push(alias_safe(k)),
+            PathSegment::Unnest => {
+                // `.tags[]` → alias `tags`. UNNEST exploded rows already
+                // surface as the flat element type.
+            }
+        }
+    }
+    let joined = parts.join("_");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn tokenize_path(path: &str) -> Result<Vec<PathSegment>> {
+    let s = path.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty path"));
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut out: Vec<PathSegment> = Vec::new();
+
+    // Optional leading dot — `.foo` or `foo` are both accepted; the latter
+    // matters for places like `sort by foo` where users sometimes drop the
+    // dot out of habit.
+    if bytes.first() == Some(&b'.') {
+        i = 1;
+    }
+
+    // First segment must be a bare identifier (no leading `.` in SQL output).
+    let (first, next) = read_ident(bytes, i)?;
+    out.push(PathSegment::Field(first));
+    i = next;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                let (ident, next) = read_ident(bytes, i + 1)?;
+                out.push(PathSegment::Field(ident));
+                i = next;
+            }
+            b'[' => {
+                let (seg, next) = read_bracket(bytes, i)?;
+                out.push(seg);
+                i = next;
+            }
+            other => {
+                return Err(anyhow!(
+                    "unexpected character '{}' in path '{}'",
+                    other as char,
+                    path
+                ));
+            }
+        }
+    }
+
+    // [] must be last.
+    if let Some(pos) = out.iter().position(|s| matches!(s, PathSegment::Unnest)) {
+        if pos != out.len() - 1 {
+            return Err(anyhow!(
+                "[] (UNNEST) must be the last segment of a path; got '{}'",
+                path
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+fn read_ident(bytes: &[u8], start: usize) -> Result<(String, usize)> {
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == start {
+        return Err(anyhow!(
+            "expected an identifier at offset {start}, got {:?}",
+            bytes.get(start).map(|&b| b as char)
+        ));
+    }
+    Ok((
+        std::str::from_utf8(&bytes[start..i])
+            .map_err(|e| anyhow!("invalid utf-8 in path: {}", e))?
+            .to_string(),
+        i,
+    ))
+}
+
+fn read_bracket(bytes: &[u8], start: usize) -> Result<(PathSegment, usize)> {
+    debug_assert_eq!(bytes[start], b'[');
+    let close = start
+        + 1
+        + bytes[start + 1..]
+            .iter()
+            .position(|&b| b == b']')
+            .ok_or_else(|| anyhow!("unterminated '[' in path"))?;
+    let inner = std::str::from_utf8(&bytes[start + 1..close])
+        .map_err(|e| anyhow!("invalid utf-8 inside brackets: {}", e))?
+        .trim();
+
+    // []  (bare) → UNNEST
+    if inner.is_empty() {
+        return Ok((PathSegment::Unnest, close + 1));
+    }
+    // ["str"] / ['str'] → map-key access. We re-quote to single quotes for
+    // SQL and escape any embedded single quotes.
+    if (inner.starts_with('"') && inner.ends_with('"'))
+        || (inner.starts_with('\'') && inner.ends_with('\''))
+    {
+        let key = &inner[1..inner.len() - 1];
+        return Ok((PathSegment::MapKey(key.to_string()), close + 1));
+    }
+    // [N] / [-N] → list index. jq is 0-indexed, DuckDB is 1-indexed; convert
+    // positives by +1, leave negatives alone (DuckDB supports `lst[-1]`
+    // for the last element directly).
+    if let Ok(n) = inner.parse::<i64>() {
+        let translated = if n >= 0 { n + 1 } else { n };
+        return Ok((PathSegment::Index(translated), close + 1));
+    }
+    Err(anyhow!("can't parse bracket subscript [{}]", inner))
+}
+
+fn render_path(segments: &[PathSegment]) -> Result<String> {
+    if segments.is_empty() {
+        return Err(anyhow!("empty path"));
+    }
+    // Build incrementally, applying UNNEST as a wrapper at the end.
+    let mut sql = match &segments[0] {
+        PathSegment::Field(name) => name.clone(),
+        other => {
+            return Err(anyhow!(
+                "path must start with an identifier, got {:?}",
+                other
+            ))
+        }
+    };
+    for seg in &segments[1..] {
+        match seg {
+            PathSegment::Field(name) => {
+                sql.push('.');
+                sql.push_str(name);
+            }
+            PathSegment::Index(n) => {
+                sql.push_str(&format!("[{}]", n));
+            }
+            PathSegment::MapKey(k) => {
+                // DuckDB's element_at on a MAP returns a LIST of matching
+                // values (because MAP keys aren't required to be unique
+                // at the type level). [1] picks the first hit, which
+                // matches the user's mental model of "a map lookup".
+                let escaped = k.replace('\'', "''");
+                sql = format!("element_at({}, '{}')[1]", sql, escaped);
+            }
+            PathSegment::Unnest => {
+                sql = format!("UNNEST({})", sql);
+            }
+        }
+    }
+    Ok(sql)
+}
+
+/// Mate to `rewrite_path_function`: derive a clean snake_case alias so the
+/// JSON output for `len(.tags)` reads `{"len_tags": 3}` instead of the
+/// SQL-flavoured `{"len(tags)": 3}`.
+pub(crate) fn path_function_alias(expr: &str) -> Option<String> {
+    let s = expr.trim();
+    let lower = s.to_ascii_lowercase();
+    for (head, alias_prefix) in [
+        ("len(", "len"),
+        ("length(", "length"),
+        ("keys(", "keys"),
+        ("values(", "values"),
+    ] {
+        if let Some(rest) = lower.strip_prefix(head) {
+            if rest.ends_with(')') {
+                let arg_start = head.len();
+                let arg = s[arg_start..s.len() - 1].trim();
+                let arg_alias = if arg.starts_with('.') {
+                    alias_for_path(arg).unwrap_or_else(|| arg.trim_start_matches('.').to_string())
+                } else {
+                    alias_safe(arg)
+                };
+                return Some(format!("{}_{}", alias_prefix, arg_alias));
+            }
+        }
+    }
+    None
+}
+
+/// Sugar for the family of jq-style path-aware functions: `len(.foo)`,
+/// `length(.foo)`, `keys(.foo)`, `values(.foo)`. Returns the rewritten
+/// SQL if the input matches one of them, else None and the caller falls
+/// back to the raw expression.
+pub(crate) fn rewrite_path_function(expr: &str) -> Option<String> {
+    let s = expr.trim();
+    let lower = s.to_ascii_lowercase();
+    for (head, sql_fn) in [
+        ("len(", "len"),
+        ("length(", "len"),
+        ("keys(", "map_keys"),
+        ("values(", "map_values"),
+    ] {
+        if let Some(rest) = lower.strip_prefix(head) {
+            if let Some(rest) = rest.strip_suffix(')') {
+                let arg_start = head.len();
+                let arg = &s[arg_start..s.len() - 1];
+                let arg = arg.trim();
+                if let Ok(p) = path_to_sql(arg) {
+                    return Some(format!("{}({})", sql_fn, p));
+                }
+                // length on a literal — let DuckDB handle it as-is.
+                let _ = rest;
+                return Some(format!("{}({})", sql_fn, arg));
+            }
+        }
+    }
+    None
+}
+
+/// Split "col" / ".col" / "col asc" / ".col desc" — returns (col_sql, ascending).
+/// Path expressions (`.events[0].amount`) are translated through
+/// `path_to_sql`; bare identifiers fall through unchanged.
 fn parse_orderby_clause(s: &str, default_asc: bool) -> (String, bool) {
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
-    if let Some(stripped) = lower.strip_suffix(" desc") {
-        (strip_dot(&s[..stripped.len()]), false)
+    let (col_part, asc) = if let Some(stripped) = lower.strip_suffix(" desc") {
+        (s[..stripped.len()].trim(), false)
     } else if let Some(stripped) = lower.strip_suffix(" asc") {
-        (strip_dot(&s[..stripped.len()]), true)
+        (s[..stripped.len()].trim(), true)
     } else {
-        (strip_dot(s), default_asc)
-    }
+        (s, default_asc)
+    };
+    // v0.10: if it starts with a dot, run the full path tokenizer so
+    // `sort by .events[0].amount desc` works. Otherwise fall back to
+    // strip_dot for backward compatibility with bare-identifier sorts.
+    let sql = if col_part.starts_with('.') {
+        path_to_sql(col_part).unwrap_or_else(|_| strip_dot(col_part))
+    } else {
+        strip_dot(col_part)
+    };
+    (sql, asc)
 }
 
 /// Find the FIRST top-level " where " inside a stage (not inside quotes).
@@ -788,18 +1153,45 @@ fn parse_projection(input: &str) -> Result<String> {
         return Err(anyhow!("empty projection"));
     }
 
-    let cols: Vec<String> = s
-        .split(',')
-        .map(|c| {
-            let c = c.trim();
-            if let Some(stripped) = c.strip_prefix('.') {
-                stripped.trim().to_string()
-            } else {
-                c.to_string()
+    // Split-on-comma is fine here because pq projections don't currently
+    // accept function calls with commas (that's what UDF macros are for —
+    // their definitions live in --udf, not inline in the projection).
+    // Iterate explicitly (rather than .map().collect()) so we can
+    // propagate path-tokenizer errors with a `?` — silently swallowing
+    // them used to surface as "syntax error at or near ']'" from DuckDB,
+    // which never points at the real problem.
+    let mut cols: Vec<String> = Vec::new();
+    for raw in s.split(',') {
+        let c = raw.trim();
+        if c.is_empty() {
+            continue;
+        }
+        let translated = if c.starts_with('.') {
+            // v0.10: a leading dot triggers full path tokenization so
+            // `.foo[]`, `.foo[0]`, `.foo["key"]`, `.foo.bar` all DTRT.
+            let sql = path_to_sql(c).map_err(|e| anyhow!("invalid path '{}': {}", c, e))?;
+            match alias_for_path(c) {
+                Some(alias) => format!("{} AS {}", sql, alias),
+                None => sql,
             }
-        })
-        .filter(|c| !c.is_empty())
-        .collect();
+        } else if let Some(rewritten) = rewrite_path_function(c) {
+            // `len(.tags)`, `keys(.metadata)` in projection context.
+            // Alias these so JSON keys come out as `len_tags` rather
+            // than the raw SQL fragment `len(tags)`.
+            let alias = path_function_alias(c).unwrap_or_default();
+            if alias.is_empty() {
+                rewritten
+            } else {
+                format!("{} AS {}", rewritten, alias)
+            }
+        } else {
+            // Bare expressions (function calls, literals, * etc.) pass
+            // through unchanged so users keep their existing escape
+            // hatches.
+            c.to_string()
+        };
+        cols.push(translated);
+    }
 
     if cols.is_empty() {
         return Err(anyhow!("could not parse projection: {}", input));
@@ -869,8 +1261,28 @@ fn rewrite_filter(input: &str) -> String {
                 None => false,
             };
             if next_is_ident && !prev_is_ident_part {
-                i += 1;
-                continue;
+                // v0.10: now that paths can contain `[N]` / `["key"]` /
+                // `.bar` segments, snip out the whole token starting at `.`
+                // and run it through path_to_sql instead of just dropping
+                // the leading dot. Falls back to the historical "drop one
+                // dot" behaviour if anything goes wrong, so plain `.foo`
+                // queries don't regress.
+                let end = scan_path_end(&chars, i);
+                let raw: String = chars[i..end].iter().collect();
+                match path_to_sql(&raw) {
+                    Ok(rewritten) if !rewritten.starts_with("UNNEST(") => {
+                        s.push_str(&rewritten);
+                        i = end;
+                        continue;
+                    }
+                    _ => {
+                        // UNNEST inside WHERE doesn't make sense — just
+                        // drop the dot and let DuckDB produce a clearer
+                        // error than we can.
+                        i += 1;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -878,6 +1290,35 @@ fn rewrite_filter(input: &str) -> String {
         i += 1;
     }
     s
+}
+
+/// Scan from a `.` to the end of a path token (idents, dots, `[...]`).
+/// Returns the index *past* the last char of the path. Used when filter
+/// rewriting needs to peel off a whole `.foo[0]["k"].bar` token.
+fn scan_path_end(chars: &[char], start: usize) -> usize {
+    let mut i = start + 1;
+    let mut depth = 0_usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '[' => {
+                depth += 1;
+                i += 1;
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                i += 1;
+            }
+            '.' | '_' => i += 1,
+            c if c.is_ascii_alphanumeric() => i += 1,
+            // Inside [ ... ] we tolerate quotes / minus / digits — the
+            // bracket scanner inside path_to_sql validates the inner
+            // content. Outside of brackets we stop here.
+            c if depth > 0 && (c == '"' || c == '\'' || c == '-' || c.is_whitespace()) => i += 1,
+            _ => break,
+        }
+    }
+    i
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -1342,6 +1783,253 @@ mod tests {
             cmp("f.parquet", "group_by .country | min .age | max .age", 20),
             "SELECT country, min(age) AS min_age, max(age) AS max_age \
              FROM read_parquet('f.parquet') GROUP BY country"
+        );
+    }
+
+    // ── v0.10 nested-path tokenizer ─────────────────────────────────────────
+
+    #[test]
+    fn path_struct_dot_unchanged() {
+        // Plain struct field access keeps DuckDB's auto-naming (`name`)
+        // — backward-compat with v0.9.x users who already lean on this.
+        assert_eq!(path_to_sql(".user.name").unwrap(), "user.name");
+        assert!(alias_for_path(".user.name").is_none());
+    }
+
+    #[test]
+    fn path_list_index_translates_jq_to_duckdb() {
+        // jq's 0-indexed → DuckDB's 1-indexed for positive integers.
+        assert_eq!(path_to_sql(".tags[0]").unwrap(), "tags[1]");
+        assert_eq!(path_to_sql(".tags[5]").unwrap(), "tags[6]");
+        assert_eq!(alias_for_path(".tags[0]").as_deref(), Some("tags_0"));
+    }
+
+    #[test]
+    fn path_list_negative_index_passthrough() {
+        // DuckDB natively supports `lst[-1]` for last-element access —
+        // we don't translate, just rename the alias to a snake_case form
+        // (`tags_neg1`) so it survives JSON serialization.
+        assert_eq!(path_to_sql(".tags[-1]").unwrap(), "tags[-1]");
+        assert_eq!(alias_for_path(".tags[-1]").as_deref(), Some("tags_neg1"));
+    }
+
+    #[test]
+    fn path_unnest_wraps_subject() {
+        assert_eq!(path_to_sql(".tags[]").unwrap(), "UNNEST(tags)");
+        assert_eq!(alias_for_path(".tags[]").as_deref(), Some("tags"));
+    }
+
+    #[test]
+    fn path_unnest_must_be_last() {
+        // `.events[].kind` is ambiguous (UNNEST then field-of-row vs
+        // list_transform) — punt to v0.11; reject it cleanly for now.
+        assert!(path_to_sql(".events[].kind").is_err());
+    }
+
+    #[test]
+    fn path_map_key_double_quoted() {
+        // ["key"] and ['key'] both compile to element_at + [1].
+        assert_eq!(
+            path_to_sql(".metadata[\"plan\"]").unwrap(),
+            "element_at(metadata, 'plan')[1]"
+        );
+        assert_eq!(
+            path_to_sql(".metadata['plan']").unwrap(),
+            "element_at(metadata, 'plan')[1]"
+        );
+        assert_eq!(
+            alias_for_path(".metadata['plan']").as_deref(),
+            Some("metadata_plan")
+        );
+    }
+
+    #[test]
+    fn path_map_key_with_apostrophe_escaped() {
+        // SQL-injection-shaped key — escape via double-up.
+        assert_eq!(
+            path_to_sql(".m[\"o'brien\"]").unwrap(),
+            "element_at(m, 'o''brien')[1]"
+        );
+    }
+
+    #[test]
+    fn path_chained_index_then_struct() {
+        assert_eq!(path_to_sql(".events[0].kind").unwrap(), "events[1].kind");
+        assert_eq!(
+            alias_for_path(".events[0].kind").as_deref(),
+            Some("events_0_kind")
+        );
+    }
+
+    #[test]
+    fn path_chained_struct_then_index() {
+        // `.foo.bar[0]` — STRUCT field then list index.
+        assert_eq!(path_to_sql(".foo.bar[2]").unwrap(), "foo.bar[3]");
+    }
+
+    #[test]
+    fn projection_with_brackets_emits_aliases() {
+        let s = cmp(
+            "f.parquet",
+            ".user_id, .tags[0], .events[0].amount, .metadata[\"plan\"]",
+            0,
+        );
+        assert_eq!(
+            s,
+            "SELECT user_id, tags[1] AS tags_0, \
+             events[1].amount AS events_0_amount, \
+             element_at(metadata, 'plan')[1] AS metadata_plan \
+             FROM read_parquet('f.parquet')"
+        );
+    }
+
+    #[test]
+    fn projection_unnest_explosion() {
+        let s = cmp("f.parquet", ".user_id, .tags[]", 0);
+        assert_eq!(
+            s,
+            "SELECT user_id, UNNEST(tags) AS tags FROM read_parquet('f.parquet')"
+        );
+    }
+
+    #[test]
+    fn path_function_len() {
+        assert_eq!(
+            rewrite_path_function("len(.tags)").as_deref(),
+            Some("len(tags)")
+        );
+        assert_eq!(
+            path_function_alias("len(.tags)").as_deref(),
+            Some("len_tags")
+        );
+        let s = cmp("f.parquet", ".user_id, len(.tags)", 0);
+        assert_eq!(
+            s,
+            "SELECT user_id, len(tags) AS len_tags FROM read_parquet('f.parquet')"
+        );
+    }
+
+    #[test]
+    fn path_function_keys_values() {
+        assert_eq!(
+            rewrite_path_function("keys(.metadata)").as_deref(),
+            Some("map_keys(metadata)")
+        );
+        assert_eq!(
+            rewrite_path_function("values(.metadata)").as_deref(),
+            Some("map_values(metadata)")
+        );
+    }
+
+    #[test]
+    fn where_with_struct_path() {
+        // STRUCT field comparisons inside WHERE — used to silently drop
+        // the dot and emit `WHERE country = ...`, breaking against
+        // schemas that have a top-level `country` AND a `.user.country`.
+        let s = cmp("f.parquet", "where .user.country == \"US\"", 20);
+        assert!(s.contains("WHERE user.country = 'US'"), "got: {}", s);
+    }
+
+    #[test]
+    fn where_with_list_index() {
+        // Numeric comparison on list element.
+        let s = cmp("f.parquet", "where .events[0].amount > 100", 20);
+        assert!(s.contains("WHERE events[1].amount > 100"), "got: {}", s);
+    }
+
+    #[test]
+    fn where_with_map_key() {
+        let s = cmp("f.parquet", "where .metadata[\"plan\"] == \"pro\"", 20);
+        assert!(
+            s.contains("WHERE element_at(metadata, 'plan')[1] = 'pro'"),
+            "got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn sort_by_nested_path() {
+        let s = cmp("f.parquet", "sort by .events[0].amount desc", 20);
+        assert!(s.contains("ORDER BY events[1].amount DESC"), "got: {}", s);
+    }
+
+    #[test]
+    fn aggregate_on_nested_path() {
+        let s = cmp("f.parquet", "sum .events[0].amount", 0);
+        assert!(s.contains("sum(events[1].amount)"), "got: {}", s);
+    }
+
+    #[test]
+    fn group_by_nested_path_strips_alias() {
+        // Regression for the v0.10 GROUP BY bug spotted on real Clarivate
+        // health data: parse_projection emits `expr AS alias` for bracket
+        // paths, and we used to copy that whole string into GROUP BY,
+        // producing a parse error. SELECT list keeps the alias; GROUP BY
+        // takes the bare expression.
+        let s = cmp(
+            "f.parquet",
+            "group_by .payer_zipped[0].type_coverage | count",
+            0,
+        );
+        assert!(
+            s.contains(
+                "SELECT payer_zipped[1].type_coverage AS payer_zipped_0_type_coverage, \
+                 count(*) AS count"
+            ),
+            "got: {}",
+            s
+        );
+        assert!(
+            s.contains("GROUP BY payer_zipped[1].type_coverage"),
+            "GROUP BY should NOT include the AS alias suffix; got: {}",
+            s
+        );
+        assert!(
+            !s.contains("GROUP BY payer_zipped[1].type_coverage AS"),
+            "GROUP BY must not have an AS clause; got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn limit_head_accepts_unix_n_flag() {
+        // Shell-pipe muscle memory reaches for `head -n 3` and `head -3`.
+        // pq's DSL stage parser used to fail those with a literal
+        // "got `-n 3`" error — actively unhelpful. Now both forms route
+        // to the same `LIMIT N` SQL.
+        for q in ["head -n 3", "head -3", "limit -n 3", "limit 3"] {
+            let s = cmp("f.parquet", q, 0);
+            assert!(
+                s.contains("LIMIT 3"),
+                "query `{}` should produce `LIMIT 3`; got: {}",
+                q,
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn projection_path_error_propagates() {
+        // `.events[].kind` is illegal (UNNEST must be terminal). We used
+        // to silently drop the leading dot and let DuckDB barf on the
+        // raw `[]` — now pq surfaces a clear "invalid path" error.
+        let err = compile_plan("f.parquet", ".events[].kind", 0).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("invalid path") && msg.contains(".events[].kind"),
+            "expected friendly path error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn strip_as_alias_helper() {
+        assert_eq!(strip_as_alias("foo"), "foo");
+        assert_eq!(strip_as_alias("foo AS bar"), "foo");
+        assert_eq!(strip_as_alias("foo as bar"), "foo");
+        assert_eq!(
+            strip_as_alias("payer_zipped[1].type_coverage AS payer_zipped_0_type_coverage"),
+            "payer_zipped[1].type_coverage"
         );
     }
 }

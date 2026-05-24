@@ -225,6 +225,39 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Date32(d) => JsonValue::String(date32_to_iso(*d)),
         Value::Time64(_, t) => JsonValue::String(format!("time({})", t)),
         Value::Timestamp(_, t) => JsonValue::String(format!("timestamp({})", t)),
+        // v0.10: nested types render as proper JSON arrays / objects so the
+        // chain idiom (`pq f.parquet '.events' | jq ... | pq -i ndjson -`)
+        // works without raw-SQL escape hatches. Before this change we fell
+        // through to `format!("{:?}", other)` which produced Rust Debug
+        // output ("List([Text(\"a\")])") that downstream tools can't parse.
+        Value::List(items) | Value::Array(items) => {
+            JsonValue::Array(items.iter().map(value_to_json).collect())
+        }
+        Value::Struct(fields) => {
+            // OrderedMap preserves declaration order — keep that in JSON.
+            let mut m = serde_json::Map::new();
+            for (k, v) in fields.iter() {
+                m.insert(k.clone(), value_to_json(v));
+            }
+            JsonValue::Object(m)
+        }
+        Value::Map(entries) => {
+            // JSON object keys are always strings; coerce non-string keys
+            // through the standard display path. Rare — most parquet MAP
+            // columns we see use VARCHAR keys (session_id, plan, etc.).
+            let mut m = serde_json::Map::new();
+            for (k, v) in entries.iter() {
+                let key_string = match k {
+                    Value::Text(s) => s.clone(),
+                    other => value_to_display(other),
+                };
+                m.insert(key_string, value_to_json(v));
+            }
+            JsonValue::Object(m)
+        }
+        Value::Enum(s) => JsonValue::String(s.clone()),
+        // Union wraps an inner Value of whichever branch matched at row time.
+        Value::Union(inner) => value_to_json(inner),
         other => JsonValue::String(format!("{:?}", other)),
     }
 }
@@ -265,6 +298,17 @@ fn value_to_display(v: &Value) -> String {
         Value::UBigInt(i) => i.to_string(),
         Value::Blob(b) => format!("<blob {} bytes>", b.len()),
         Value::Date32(d) => date32_to_iso(*d),
+        // v0.10: nested types render as compact JSON in tables/CSV so they
+        // sit cleanly in a single cell. We reuse value_to_json to get the
+        // structural representation, then serde_json's compact serializer.
+        Value::List(_)
+        | Value::Array(_)
+        | Value::Struct(_)
+        | Value::Map(_)
+        | Value::Enum(_)
+        | Value::Union(_) => {
+            serde_json::to_string(&value_to_json(v)).unwrap_or_else(|_| format!("{:?}", v))
+        }
         other => format!("{:?}", other),
     }
 }
@@ -292,5 +336,94 @@ mod tests {
         assert_eq!(date32_to_iso(20_592), "2026-05-19");
         assert_eq!(date32_to_iso(19_358), "2023-01-01");
         assert_eq!(date32_to_iso(-1), "1969-12-31");
+    }
+
+    // ── v0.10 nested-type renderer ─────────────────────────────────────────
+
+    use duckdb::types::OrderedMap;
+    use serde_json::json;
+
+    #[test]
+    fn list_renders_as_json_array() {
+        let v = Value::List(vec![
+            Value::Text("a".into()),
+            Value::Text("b".into()),
+            Value::Null,
+        ]);
+        assert_eq!(value_to_json(&v), json!(["a", "b", null]));
+        assert_eq!(value_to_display(&v), r#"["a","b",null]"#);
+    }
+
+    #[test]
+    fn struct_preserves_field_order() {
+        // OrderedMap preserves declaration order — verify the JSON we
+        // emit honours that contract (matters for snapshot consumers
+        // and for users who pipe to jq with positional logic).
+        let fields = OrderedMap::from(vec![
+            ("name".to_string(), Value::Text("alice".into())),
+            ("country".to_string(), Value::Text("US".into())),
+            ("age".to_string(), Value::Int(30)),
+        ]);
+        let v = Value::Struct(fields);
+        let s = serde_json::to_string(&value_to_json(&v)).unwrap();
+        assert_eq!(s, r#"{"name":"alice","country":"US","age":30}"#);
+    }
+
+    #[test]
+    fn map_renders_as_json_object_with_string_keys() {
+        let entries = OrderedMap::from(vec![
+            (Value::Text("plan".into()), Value::Text("pro".into())),
+            (Value::Text("seat".into()), Value::Text("3".into())),
+        ]);
+        let v = Value::Map(entries);
+        assert_eq!(value_to_json(&v), json!({"plan":"pro","seat":"3"}));
+    }
+
+    #[test]
+    fn list_of_struct_round_trips() {
+        // The shape that hits LIST<STRUCT> in real parquet files
+        // (event arrays, line items, etc.). Was the worst pre-v0.10
+        // bug — used to dump as `List([Struct(OrderedMap([...]))])`.
+        let row1 = OrderedMap::from(vec![
+            ("kind".to_string(), Value::Text("click".into())),
+            ("amount".to_string(), Value::Double(1.0)),
+        ]);
+        let row2 = OrderedMap::from(vec![
+            ("kind".to_string(), Value::Text("buy".into())),
+            ("amount".to_string(), Value::Double(9.0)),
+        ]);
+        let v = Value::List(vec![Value::Struct(row1), Value::Struct(row2)]);
+        assert_eq!(
+            value_to_json(&v),
+            json!([
+                {"kind":"click","amount":1.0},
+                {"kind":"buy","amount":9.0},
+            ])
+        );
+    }
+
+    #[test]
+    fn empty_collections_serialize_correctly() {
+        assert_eq!(value_to_json(&Value::List(vec![])), json!([]));
+        assert_eq!(
+            value_to_json(&Value::Struct(OrderedMap::from(vec![]))),
+            json!({})
+        );
+        assert_eq!(
+            value_to_json(&Value::Map(OrderedMap::from(vec![]))),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn nested_value_csv_quotes_when_needed() {
+        let v = Value::List(vec![Value::Text("a,b".into()), Value::Text("c".into())]);
+        // Has a comma in its compact JSON ([... , ...]) so should be quoted.
+        let cell = value_to_csv(&v);
+        assert!(
+            cell.starts_with('"') && cell.ends_with('"'),
+            "got: {}",
+            cell
+        );
     }
 }
