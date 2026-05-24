@@ -1,6 +1,6 @@
 [package]
 name = "pq"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2021"
 description = "jq for Parquet — query parquet files with a concise expression syntax"
 authors = ["Hua Wang <thehwang@users.noreply.github.com>"]
@@ -44,6 +44,14 @@ tempfile = "3"
 # `<` redirect) vs a pipe — used to skip the spool for the redirect
 # case. Already a transitive dep through tempfile / duckdb-rs.
 libc = "0.2"
+# v0.12: SIGINT handling for big-file mode. Ctrl-C during a long
+# DuckDB scan calls `Connection::interrupt_handle().interrupt()`
+# instead of just killing the process — gives DuckDB a chance to
+# unwind cleanly and surface a "Query interrupted" error. Second
+# Ctrl-C falls back to immediate exit, in case interrupt() takes
+# too long. ctrlc is a tiny wrapper around signal-hook with no
+# unsafe in our call path.
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [dev-dependencies]
 # v0.8 snapshot tests for the TUI rendering. We feed a fake App into

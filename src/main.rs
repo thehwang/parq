@@ -151,6 +151,15 @@ enum Cmd {
         file: String,
         #[arg(short = 'i', long, default_value = "auto")]
         input: String,
+        /// Force the metadata-only path (parquet_file_metadata).
+        ///
+        /// On parquet inputs this skips the data scan entirely and
+        /// reads the row count from the footer of every matched file —
+        /// orders of magnitude faster on multi-GB files. Auto-on for
+        /// local parquet files >= 1 GB; this flag forces it on
+        /// otherwise (e.g. cloud paths where size detection is hard).
+        #[arg(long = "lite")]
+        lite: bool,
     },
     /// Interactive TUI: 4-panel browser (Columns / Filters / editable Query / live Data).
     /// On exit, prints the equivalent `pq` CLI one-liner so you can copy it
@@ -174,6 +183,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let conn = open_conn()?;
     register_udfs(&conn, &cli.udfs)?;
+
+    // v0.12: SIGINT translates into DuckDB's interrupt() instead of an
+    // immediate kill. Long parquet scans get a chance to unwind cleanly
+    // and surface a "Query interrupted" error; second Ctrl-C exits hard
+    // in case the first interrupt itself takes too long (e.g. blocked
+    // on a network read against gs:// or s3://).
+    install_sigint_handler(&conn);
+
     let fmt = OutputFormat::resolve(&cli.output);
 
     // Watch mode wraps execution in a loop with an ANSI screen-clear before each tick.
@@ -305,6 +322,40 @@ pub(crate) fn open_conn() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Wire SIGINT to DuckDB's interrupt API so Ctrl-C cancels the running
+/// query instead of killing pq mid-stream.
+///
+/// Behaviour:
+///   * 1st Ctrl-C → call `InterruptHandle::interrupt()` and write a
+///     short notice to stderr. DuckDB returns from `query()` with an
+///     "INTERRUPT" error which surfaces as a normal `Err(_)` we print
+///     via the existing error path.
+///   * 2nd Ctrl-C → exit immediately with code 130 (128 + SIGINT). This
+///     is the safety net for cases where interrupt() can't unwind fast
+///     enough (very long network reads against gs://, s3://, etc.).
+fn install_sigint_handler(conn: &Connection) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ALREADY_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    let handle = conn.interrupt_handle();
+    if let Err(e) = ctrlc::set_handler(move || {
+        if ALREADY_INTERRUPTED.swap(true, Ordering::SeqCst) {
+            // Second hit — bail out hard.
+            std::process::exit(130);
+        }
+        eprintln!("\npq: interrupt requested (press Ctrl-C again to force-exit)");
+        handle.interrupt();
+    }) {
+        // Don't fail the run if we can't install the handler — fall
+        // back to the OS default (immediate kill on SIGINT). This is
+        // possible in oddball environments (already-installed handler,
+        // signal disposition pinned by parent process, etc.).
+        if std::env::var_os("PQ_DEBUG").is_some() {
+            eprintln!("pq: failed to install SIGINT handler: {e}");
+        }
+    }
+}
+
 fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -> Result<()> {
     // The TUI takes over the terminal — handle it before we build any SQL.
     if let Cmd::Tui {
@@ -340,7 +391,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
         | Cmd::Sample { file, input, .. }
         | Cmd::Head { file, input, .. }
         | Cmd::Tail { file, input, .. }
-        | Cmd::Count { file, input } => (file.clone(), input.as_str()),
+        | Cmd::Count { file, input, .. } => (file.clone(), input.as_str()),
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
     };
     let input_fmt = resolve_input_format(input_str, &raw_file)?;
@@ -367,9 +418,247 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
              SELECT * EXCLUDE (__rn) FROM t \
              ORDER BY __rn DESC LIMIT {n}"
         ),
-        Cmd::Count { .. } => format!("SELECT count(*) AS rows FROM {src}"),
+        Cmd::Count { lite, .. } => count_sql(&spool.resolved, input_fmt, *lite, &src),
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
     };
 
     output::run_and_print(conn, &sql, fmt)
+}
+
+/// Build the SQL for `pq count`.
+///
+/// Default path is a regular `count(*) FROM read_parquet(...)`. v0.12
+/// adds a metadata-only fast path: when the input is parquet **and**
+/// either the user passed `--lite` or the file is large enough to
+/// trip the auto-lite threshold (1 GB by default, override via
+/// `PQ_LITE_THRESHOLD` in bytes), we read row counts straight from
+/// the parquet footer via `parquet_file_metadata(...)`. No scan, no
+/// decompress — just the file's own self-reported row count. On a
+/// 40 GB local file this is the difference between seconds and a
+/// fraction of a second; on globs it's per-file row counts summed.
+fn count_sql(
+    resolved_path: &str,
+    input_fmt: InputFormat,
+    forced: bool,
+    src: &str,
+) -> String {
+    let auto = should_auto_lite(resolved_path);
+    if input_fmt == InputFormat::Parquet && (forced || auto) {
+        let escaped = resolved_path.replace('\'', "''");
+        if auto && !forced {
+            // Inform on stderr so a non-TTY consumer of stdout (jq,
+            // awk, > redirect) doesn't see the banner. Ignored if the
+            // user redirected stderr too; that's their call.
+            eprintln!(
+                "pq: lite mode (file >= {}; reading row count from parquet footer)",
+                fmt_bytes(lite_threshold())
+            );
+        }
+        format!(
+            "SELECT sum(num_rows)::BIGINT AS rows FROM parquet_file_metadata('{escaped}')"
+        )
+    } else {
+        format!("SELECT count(*) AS rows FROM {src}")
+    }
+}
+
+/// Threshold in bytes above which we auto-enable lite mode for local
+/// parquet files. Default 1 GB; override via `PQ_LITE_THRESHOLD` (raw
+/// integer bytes, no suffix parsing — keep it simple).
+fn lite_threshold() -> u64 {
+    const DEFAULT: u64 = 1024 * 1024 * 1024; // 1 GB
+    std::env::var("PQ_LITE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT)
+}
+
+/// True when `path` looks like a local file/glob whose size reaches
+/// the auto-lite threshold. Cloud paths (`gs://`, `s3://`, `http://`)
+/// always return false — checking size requires a network round-trip
+/// we don't want to spend; the user can pass `--lite` explicitly.
+///
+/// For globs, we sum the sizes of every matched file. If glob
+/// expansion fails (DuckDB-side glob, can't tell from here), we
+/// conservatively return false — the slow path still works, just
+/// without the lite shortcut.
+fn should_auto_lite(path: &str) -> bool {
+    if path.contains("://") {
+        return false;
+    }
+    let threshold = lite_threshold();
+    if let Some(ix) = path.find(['*', '?', '[']) {
+        // Glob: walk siblings of the directory before the first
+        // wildcard. We cap at 64 entries so a `**` that matches
+        // everything doesn't turn into a `du -s` proxy.
+        let dir = std::path::Path::new(&path[..ix])
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut total: u64 = 0;
+        for (count, entry) in entries.flatten().enumerate() {
+            if count >= 64 {
+                break;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total = total.saturating_add(meta.len());
+                    if total >= threshold {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    } else {
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && m.len() >= threshold)
+            .unwrap_or(false)
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0usize;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v.fract() < 0.05 {
+        format!("{:.0} {}", v, UNITS[i])
+    } else {
+        format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn fmt_bytes_picks_right_unit() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1 KB");
+        assert_eq!(fmt_bytes(1500), "1.5 KB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1 MB");
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1 GB");
+        assert_eq!(fmt_bytes(1024u64 * 1024 * 1024 * 1024), "1 TB");
+    }
+
+    #[test]
+    fn lite_threshold_default_is_one_gb() {
+        // PQ_LITE_THRESHOLD must NOT be set during this test for the
+        // default to apply. Tests in this module run in-process so an
+        // env var set by a sibling test could leak through; clear
+        // defensively to keep this test order-independent.
+        // SAFETY: env access is process-global; we don't run this
+        // module's tests in parallel against fixtures that depend on
+        // the env var.
+        unsafe {
+            std::env::remove_var("PQ_LITE_THRESHOLD");
+        }
+        assert_eq!(lite_threshold(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn lite_threshold_honors_override() {
+        // SAFETY: see lite_threshold_default_is_one_gb.
+        unsafe {
+            std::env::set_var("PQ_LITE_THRESHOLD", "2048");
+        }
+        assert_eq!(lite_threshold(), 2048);
+        unsafe {
+            std::env::remove_var("PQ_LITE_THRESHOLD");
+        }
+    }
+
+    #[test]
+    fn auto_lite_skips_remote_paths() {
+        // Cloud paths always return false — checking sizes over the
+        // network would be a footgun on `pq schema gs://huge.parquet`.
+        assert!(!should_auto_lite("gs://bucket/big.parquet"));
+        assert!(!should_auto_lite("s3://b/x.parquet"));
+        assert!(!should_auto_lite("https://example.com/x.parquet"));
+    }
+
+    #[test]
+    fn auto_lite_below_threshold_returns_false() {
+        // A small temp file shouldn't trip the default 1 GB threshold.
+        let mut f = tempfile::NamedTempFile::new().expect("tmpfile");
+        f.write_all(b"hello").expect("write");
+        let path = f.path().to_string_lossy().into_owned();
+        // Force default threshold so this test stays deterministic.
+        unsafe {
+            std::env::remove_var("PQ_LITE_THRESHOLD");
+        }
+        assert!(!should_auto_lite(&path));
+    }
+
+    #[test]
+    fn auto_lite_above_threshold_returns_true() {
+        // Set the threshold to 1 byte so any non-empty file qualifies.
+        let mut f = tempfile::NamedTempFile::new().expect("tmpfile");
+        f.write_all(b"hello").expect("write");
+        let path = f.path().to_string_lossy().into_owned();
+        unsafe {
+            std::env::set_var("PQ_LITE_THRESHOLD", "1");
+        }
+        assert!(should_auto_lite(&path));
+        unsafe {
+            std::env::remove_var("PQ_LITE_THRESHOLD");
+        }
+    }
+
+    #[test]
+    fn count_sql_lite_uses_metadata_function_for_parquet() {
+        // Forced lite + parquet → metadata-only SQL, no banner since
+        // forced means user opted in.
+        let sql = count_sql(
+            "/tmp/x.parquet",
+            InputFormat::Parquet,
+            true,
+            "read_parquet('/tmp/x.parquet')",
+        );
+        assert!(
+            sql.contains("parquet_file_metadata"),
+            "lite forced should pick metadata path; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn count_sql_falls_back_to_count_star_for_ndjson_even_when_lite() {
+        // NDJSON has no parquet metadata function; lite mode is a
+        // no-op for non-parquet inputs.
+        let sql = count_sql(
+            "/tmp/x.ndjson",
+            InputFormat::Ndjson,
+            true,
+            "read_json('/tmp/x.ndjson', format='newline_delimited')",
+        );
+        assert!(
+            sql.contains("count(*)"),
+            "non-parquet lite should fall back to count(*); got: {sql}"
+        );
+    }
+
+    #[test]
+    fn count_sql_default_path_uses_count_star() {
+        // No --lite, no auto-trigger → original count(*) path so
+        // existing CLI behaviour is preserved.
+        let sql = count_sql(
+            "/nonexistent.parquet",
+            InputFormat::Parquet,
+            false,
+            "read_parquet('/nonexistent.parquet')",
+        );
+        assert!(
+            sql.contains("count(*)"),
+            "default count path should be count(*); got: {sql}"
+        );
+    }
 }

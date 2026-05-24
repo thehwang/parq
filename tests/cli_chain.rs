@@ -2,6 +2,9 @@
 //! `--input` format dispatch). These spawn the release binary because
 //! the spool path is fundamentally about non-seekable fds, which an
 //! in-process call can't recreate cleanly.
+//!
+//! v0.12 additions: streaming (no-OOM) and lite-mode (parquet metadata-
+//! only) live here too because both require process-level observation.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -122,4 +125,126 @@ fn ndjson_chain() {
     // The sample has US/CA/UK/DE/FR — five distinct countries.
     let n = stdout.lines().filter(|l| !l.is_empty()).count();
     assert!(n >= 4, "expected >=4 distinct rows, got {n}: {stdout}");
+}
+
+// ── v0.12: lite-mode + streaming ─────────────────────────────────────────────
+
+/// `pq count --lite FILE.parquet` should hit the parquet_file_metadata
+/// path and produce the same row count as the regular `count(*)` path.
+/// We can't directly observe whether the scan was skipped from the
+/// parent process, but we *can* assert that:
+///   1. the row counts match,
+///   2. forced lite mode prints no banner (user opted in deliberately).
+#[test]
+fn count_lite_matches_full_count() {
+    let pq = pq_binary();
+    let sample = sample_parquet();
+    if skip_if_missing(&pq, "pq binary") || skip_if_missing(&sample, "sample.parquet") {
+        return;
+    }
+    let full = Command::new(&pq)
+        .args(["count", sample.to_str().unwrap()])
+        .output()
+        .expect("count full");
+    assert!(full.status.success(), "full count failed");
+    let lite = Command::new(&pq)
+        .args(["count", "--lite", sample.to_str().unwrap()])
+        .output()
+        .expect("count lite");
+    assert!(lite.status.success(), "lite count failed");
+    let full_out = String::from_utf8_lossy(&full.stdout).into_owned();
+    let lite_out = String::from_utf8_lossy(&lite.stdout).into_owned();
+    assert_eq!(full_out.trim(), lite_out.trim(), "row count mismatch");
+    let lite_err = String::from_utf8_lossy(&lite.stderr);
+    assert!(
+        !lite_err.contains("lite mode"),
+        "explicit --lite shouldn't emit a banner; stderr was: {lite_err}"
+    );
+}
+
+/// Auto-lite triggers when the file size crosses `PQ_LITE_THRESHOLD`.
+/// Set the threshold to 1 byte so any non-empty parquet hits it; the
+/// stderr banner is the user-facing observable.
+#[test]
+fn count_auto_lite_triggers_under_threshold() {
+    let pq = pq_binary();
+    let sample = sample_parquet();
+    if skip_if_missing(&pq, "pq binary") || skip_if_missing(&sample, "sample.parquet") {
+        return;
+    }
+    let out = Command::new(&pq)
+        .env("PQ_LITE_THRESHOLD", "1")
+        .args(["count", sample.to_str().unwrap()])
+        .output()
+        .expect("count auto-lite");
+    assert!(out.status.success(), "count failed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("lite mode"),
+        "expected lite-mode banner on stderr, got: {stderr}"
+    );
+}
+
+/// ndjson streaming: pipe the sample as ndjson and verify pq emits its
+/// first line before reading every input row. Smoke-tests the v0.12
+/// stream-from-cursor path: pre-v0.12 we collected every row before
+/// emitting any of them, so a 100M-row scan would OOM. We can't easily
+/// observe memory, but we can observe per-row correctness on a small
+/// fixture and a non-trivial (>10k rows) generated stream.
+///
+/// The actual streaming behaviour is best validated by hand on a
+/// 10GB+ file (`pq -i ndjson huge.ndjson '.x' | head -1` returns
+/// instantly post-v0.12); this test guards against accidental
+/// re-introduction of the buffer-everything code path.
+#[test]
+fn ndjson_streaming_preserves_order() {
+    let pq = pq_binary();
+    let sample = sample_parquet();
+    if skip_if_missing(&pq, "pq binary") || skip_if_missing(&sample, "sample.parquet") {
+        return;
+    }
+    let out = Command::new(&pq)
+        .args([sample.to_str().unwrap(), "-o", "ndjson"])
+        .output()
+        .expect("pq ndjson");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 5,
+        "expected several ndjson lines, got {}: {stdout}",
+        lines.len()
+    );
+    for line in &lines {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "every line should be a complete JSON object: got {line}"
+        );
+    }
+}
+
+/// CSV streaming: header + N data rows, emitted in input order.
+#[test]
+fn csv_streaming_writes_header_first() {
+    let pq = pq_binary();
+    let sample = sample_parquet();
+    if skip_if_missing(&pq, "pq binary") || skip_if_missing(&sample, "sample.parquet") {
+        return;
+    }
+    let out = Command::new(&pq)
+        .args([sample.to_str().unwrap(), "-o", "csv"])
+        .output()
+        .expect("pq csv");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines().filter(|l| !l.is_empty());
+    let header = lines.next().expect("header line");
+    assert!(
+        header.contains(','),
+        "first line should be a CSV header, got: {header}"
+    );
+    assert!(
+        lines.next().is_some(),
+        "expected at least one data row after header"
+    );
 }

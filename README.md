@@ -484,6 +484,53 @@ escape hatch is always available:
 pq events.parquet 'SELECT user_id, list_filter(events, e -> e.amount > 5) AS big FROM FILE'
 ```
 
+## Big-file mode (v0.12)
+
+`pq` now treats parquet files large enough to be painful as first-class
+inputs — no flags required for the common cases:
+
+```bash
+# Streaming output. ndjson / csv / raw-line outputs ship rows to stdout
+# the moment DuckDB hands them over — `pq -o ndjson huge.parquet '.user_id' | head -1`
+# returns instantly even on a 40 GB file. Pre-v0.12 we collected every
+# row into memory before emitting any of them.
+pq -o ndjson huge.parquet '.user_id' | head -1
+
+# Metadata-only count for parquet. Auto-on when the file is ≥ 1 GB
+# (override with `PQ_LITE_THRESHOLD=<bytes>`); force it explicitly
+# with --lite. Skips the data scan and reads num_rows from each
+# file's footer — orders of magnitude faster on big files.
+pq count huge.parquet              # auto-lite if >= 1 GB
+pq count --lite glob/*.parquet     # always lite, even on small files
+
+# Cancel mid-query with Ctrl-C. CLI: SIGINT is forwarded to DuckDB's
+# `interrupt_handle.interrupt()`, which unwinds within milliseconds
+# instead of hanging on a multi-GB scan. Second Ctrl-C exits hard
+# (130) in case interrupt() itself blocks on a slow network read.
+pq events.parquet 'group_by .events[].kind | count' &
+sleep 0.5; kill -INT %1            # → "Query interrupted" + clean exit
+
+# Inside the TUI, Ctrl-C cancels a running EXPLAIN ANALYZE without
+# leaving the TUI; press Ctrl-C again to quit. Useful when the
+# Explain panel kicks off a 30 s analyze on a remote 12 GB file
+# and you decide you didn't actually need it.
+pq tui huge.parquet
+# (in TUI) press E for analyze, Ctrl-C to cancel mid-run
+```
+
+| Knob | Purpose |
+|---|---|
+| `--lite` (on `pq count`) | Force parquet metadata-only path |
+| `PQ_LITE_THRESHOLD=<bytes>` | Override the 1 GB auto-lite threshold |
+| Ctrl-C (CLI) | First press = interrupt query; second press = exit 130 |
+| Ctrl-C (TUI) | Cancel running ANALYZE; press again with no job to quit |
+
+For files that don't fit on the local disk, point `pq` at `gs://` /
+`s3://` / `https://` URLs — DuckDB's httpfs is bundled, and we set up
+credentials from `AWS_*` / `PQ_GCS_*` env vars automatically. Lite-mode
+auto-detection only fires for local paths (size detection over the
+network is a footgun); pass `--lite` explicitly for cloud parquet.
+
 ## Shell primitive (v0.9)
 
 `pq` reads stdin as a first-class source so it composes with `cat`, `aws s3 cp`,
@@ -540,7 +587,35 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.11.1** (current)
+**v0.12** (current) — Big-file mode
+- [x] Streaming output for ndjson / csv / raw-lines — rows go straight from
+      DuckDB's row cursor to stdout without ever filling a `Vec`. Memory
+      stays flat regardless of result-set size; `head -1` returns instantly.
+- [x] CLI Ctrl-C → `Connection::interrupt_handle().interrupt()`. A multi-GB
+      parquet scan unwinds within milliseconds with a clean error instead
+      of a half-stream + dirty exit. Second Ctrl-C falls through to a hard
+      exit 130 in case interrupt() blocks on a slow remote read.
+- [x] TUI Ctrl-C cancels an in-flight EXPLAIN ANALYZE before it touches
+      `should_quit`. Worker thread receives interrupt(), badge clears,
+      Explain panel falls back to its previous state. A second Ctrl-C
+      with no job running quits as before.
+- [x] `pq count --lite` (and auto-on for local parquet ≥ 1 GB) reads row
+      counts from `parquet_file_metadata(...)` instead of scanning. Glob
+      paths sum across files. Override the threshold via
+      `PQ_LITE_THRESHOLD=<bytes>`.
+
+**v0.11.1**
+- [x] Custom single-line table preset — clean `│ ─ ┌ ┐` charset (DuckDB-CLI style),
+      replaces `UTF8_FULL_CONDENSED`'s exotic `┆ ╞ ═ ╪ ╡` glyphs that some macOS
+      fonts mis-rendered and made tables look diagonally staggered
+- [x] TUI installs a panic hook + best-effort `teardown_terminal` — a panic in
+      the event loop no longer leaves your shell in raw mode after `pq tui`
+      exits (the symptom was every subsequent multi-line command rendering
+      stair-stepped until you ran `stty sane`)
+- [x] Cargo.toml version finally tracks the git tag — `pq --version` shows the
+      real release number, no more lag
+
+**v0.11**
 - [x] Custom single-line table preset — clean `│ ─ ┌ ┐` charset (DuckDB-CLI style),
       replaces `UTF8_FULL_CONDENSED`'s exotic `┆ ╞ ═ ╪ ╡` glyphs that some macOS
       fonts mis-rendered and made tables look diagonally staggered
@@ -606,20 +681,27 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's coming
 
-**v0.6 — TUI depth pass**
-- [ ] Semantic cursor sync — column lineage highlighting across all panels
-- [ ] `Y` truly copies to clipboard (arboard with feature flag for headless builds)
-- [ ] Horizontal scroll in Data panel for long-string columns
-- [ ] Real-time row count (currently shows "preview rows", not full count)
-- [ ] `Filters` panel becomes interactive (drop a filter with `d`, edit with `e`)
-- [ ] Explain panel with `EXPLAIN ANALYZE` + heuristic hints (zonemap pruning, projection PD)
-- [ ] Drill-down: Enter on an aggregate cell → auto-generates `where` for underlying rows
-- [ ] DuckDB GCS `credential_chain` ADC support once duckdb#22413 lands
+**v0.13 — Big-file mode part 2**
+- [ ] TUI preview runs in a worker thread (today it blocks the event loop —
+      type a query against a 12 GB file and the TUI freezes). Will hold
+      its own `interrupt_handle` so Ctrl-C cancels there too.
+- [ ] CLI stderr spinner / elapsed timer for queries > N ms (off by default
+      when stderr is a pipe, gated behind `--no-progress`).
+- [ ] Explain panel surfaces row-group pruning from DuckDB's JSON profile
+      (`operator_rows_scanned` / `operator_cardinality`) — "filter cut
+      80 % of file before decompression"-style hints.
+- [ ] Streaming JSON output (today JSON still buffers because of the
+      wrapping `[]`; a hand-written incremental array writer fixes it).
+- [ ] `pq stats --lite` for parquet — read column min/max/null counts from
+      row-group metadata, no scan.
 
-**v0.7+**
+**Beyond v0.13**
+- [ ] Schema diff: `pq diff a.parquet b.parquet`
+- [ ] Multi-file tabs in TUI with visual join builder
 - [ ] Query history with branching (every keystroke a frame, rewindable)
-- [ ] Schema diff between two parquet files
-- [ ] Multi-file tabs with visual join builder
+- [ ] Conditional DSL (`if .x > 0 then 1 else 0 end`), regex sugar, date math
+- [ ] "Did you mean .country?" typo suggestions on column-not-found errors
+- [ ] DuckDB GCS `credential_chain` ADC support once duckdb#22413 lands
 
 ## Limitations (v0)
 

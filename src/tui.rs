@@ -193,7 +193,8 @@ struct ExplainSummary {
 /// when the user cancels (drops `analyze_job`), we just orphan the
 /// thread. It'll send into a disconnected tx, ignore the error, and
 /// exit. Cheap, no unsafe, no extra DuckDB plumbing.
-#[derive(Debug)]
+// AnalyzeJob can't `derive(Debug)` because duckdb's InterruptHandle
+// doesn't implement Debug; carry the field as-is and skip the derive.
 struct AnalyzeJob {
     /// Result channel — `try_recv` non-blockingly each tick.
     rx: mpsc::Receiver<ExplainSummary>,
@@ -201,6 +202,13 @@ struct AnalyzeJob {
     /// "ANALYZE running… 1.2 s" so the user can tell whether it's
     /// hung vs just slow.
     started_at: Instant,
+    /// v0.12: handle to the worker's DuckDB connection. Lets the main
+    /// thread call `interrupt()` when the user hits Ctrl-C — DuckDB
+    /// then returns an INTERRUPT error from its current parquet scan
+    /// and the worker exits within milliseconds. Without this, the
+    /// worker would keep grinding through a multi-GB file even after
+    /// the user moved on.
+    interrupt: std::sync::Arc<duckdb::InterruptHandle>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -923,63 +931,63 @@ impl<'ta> App<'ta> {
     ///   trivial files. For remote parquet, opening multiple
     ///   connections lets analyze run concurrently with previews.
     fn start_analyze(&mut self) {
-        // Drop any outstanding job by reassignment — the worker will
-        // discover its tx is disconnected when it tries to send and
-        // exit cleanly. Its query continues running in the background
-        // until DuckDB notices (we don't actively interrupt because
-        // duckdb-rs Connection isn't Sync; the cleanup is "best-effort
-        // forget"). Worth revisiting if it shows up in profiles.
-        self.analyze_job = None;
+        // Cancel + interrupt any outstanding job. v0.12: we also call
+        // interrupt() so the worker's parquet scan unwinds within
+        // milliseconds rather than grinding on for tens of seconds
+        // against a 40 GB file we no longer care about.
+        self.cancel_analyze();
         if self.preview.sql.is_empty() {
             return;
         }
+        // Open the worker's connection on the main thread so we can
+        // grab its interrupt handle BEFORE moving the connection over.
+        // `Connection` is `Send` (duckdb-rs marks it so) so the move
+        // is safe; the handle stays here for cancellation.
+        let Ok(conn) = crate::open_conn() else {
+            return;
+        };
+        let udfs = self.udfs.clone();
+        if crate::register_udfs(&conn, &udfs).is_err() {
+            // Macro registration failure is rare (would have caught it
+            // on session start). Bail silently — the panel's empty-
+            // result path falls back to the main error state.
+            return;
+        }
+        let interrupt = conn.interrupt_handle();
         let (tx, rx) = mpsc::channel();
         let plan_sql = self.preview.sql.clone();
         let file = self.file.clone();
         let query = self.current_query_text();
-        // v0.11: snapshot the user's --udf list into the worker so its
-        // fresh connection re-registers the macros before running
-        // EXPLAIN ANALYZE. Without this, queries that reference a UDF
-        // would compile in the main TUI session but fail in the
-        // analyze worker with a "Catalog Error" — confusing because
-        // the user can see the same SQL working in the data panel.
-        let udfs = self.udfs.clone();
         thread::spawn(move || {
-            // Each thread owns its own connection — created lazily on
-            // entry, dropped at scope exit. This is also where the
-            // cloud-secret env vars get re-injected, so analyze
-            // queries against gs:// / s3:// pick up the same
-            // credentials the main TUI is using.
-            let Ok(conn) = crate::open_conn() else {
-                return;
-            };
-            if let Err(_e) = crate::register_udfs(&conn, &udfs) {
-                // Macro registration failure is rare (would have caught
-                // it on session start). Bail silently — the analyze
-                // worker's empty-result path falls back to the main
-                // panel's existing error state.
-                return;
-            }
             if let Some(summary) = run_analyze(&conn, &plan_sql, &file, &query) {
                 // tx.send returns Err when the receiver was dropped
-                // (user pressed Esc to cancel). That's expected — we
-                // silently discard the result instead of panicking.
+                // (user pressed Esc / Ctrl-C to cancel). That's
+                // expected — we silently discard the result instead
+                // of panicking.
                 let _ = tx.send(summary);
             }
+            // `conn` is dropped here, freeing the in-memory db.
         });
         self.analyze_job = Some(AnalyzeJob {
             rx,
             started_at: Instant::now(),
+            interrupt,
         });
     }
 
-    /// Drop the in-flight ANALYZE job's receiver. The worker thread
-    /// keeps running its query until DuckDB finishes, but its result
-    /// is now orphaned (silently discarded by tx.send when it tries
-    /// to deliver). The badge clears immediately for snappy UX.
+    /// Drop the in-flight ANALYZE job and tell DuckDB to interrupt
+    /// the worker's running query.
+    ///
+    /// v0.12 change: we now call `interrupt()` on the worker's
+    /// connection in addition to dropping the receiver. Pre-v0.12 the
+    /// receiver-drop alone meant the worker kept grinding through its
+    /// scan until DuckDB finished naturally — fine on a 100 MB file,
+    /// brutal on a 40 GB one. With interrupt(), the worker returns
+    /// from `query()` within milliseconds. The badge clears
+    /// immediately either way.
     fn cancel_analyze(&mut self) -> bool {
-        if self.analyze_job.is_some() {
-            self.analyze_job = None;
+        if let Some(job) = self.analyze_job.take() {
+            job.interrupt.interrupt();
             true
         } else {
             false
@@ -1342,8 +1350,17 @@ impl<'ta> App<'ta> {
 // ─── Event handling ──────────────────────────────────────────────────────────
 
 fn on_key(app: &mut App<'_>, key: KeyEvent) {
-    // Ctrl-C always quits, regardless of any modal state.
+    // Ctrl-C: prefer to interrupt a running query first; only quit if
+    // there's nothing to cancel. v0.12 refinement — a long ANALYZE
+    // against a multi-GB file used to leave users with no escape:
+    // first Ctrl-C would drop them out of the TUI entirely, second
+    // Ctrl-C would do nothing because the process was already gone.
+    // Now Ctrl-C cancels the analyze; a follow-up Ctrl-C (with no
+    // job running) quits as before.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if app.cancel_analyze() {
+            return;
+        }
         app.should_quit = true;
         return;
     }

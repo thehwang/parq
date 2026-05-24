@@ -84,6 +84,21 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
     let column_names: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
     let ncols = column_names.len();
 
+    // v0.12: stream ndjson / csv / raw-lines straight from the cursor —
+    // these formats don't need to know about future rows, so we write
+    // each one to stdout the moment DuckDB hands it over. This is the
+    // difference between OOM-ing on a 100M-row scan and seeing the
+    // first line in milliseconds. Table and JSON still buffer (table
+    // needs every value for column-width arrangement, JSON needs the
+    // wrapping array) — those are the formats users reach for on
+    // already-trimmed result sets.
+    match fmt {
+        OutputFormat::Ndjson => return stream_ndjson(&column_names, &mut rows, ncols),
+        OutputFormat::Csv => return stream_csv(&column_names, &mut rows, ncols),
+        OutputFormat::RawLines => return stream_raw_lines(&mut rows),
+        _ => {}
+    }
+
     let mut collected: Vec<Vec<Value>> = Vec::new();
     while let Some(row) = rows.next()? {
         let mut r = Vec::with_capacity(ncols);
@@ -96,27 +111,55 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
     match fmt {
         OutputFormat::Table => print_table(&column_names, &collected),
         OutputFormat::Json => print_json(&column_names, &collected),
-        OutputFormat::Ndjson => print_ndjson(&column_names, &collected),
-        OutputFormat::Csv => print_csv(&column_names, &collected),
-        OutputFormat::RawLines => print_raw_lines(&collected),
+        OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::RawLines => {
+            unreachable!("streamed earlier")
+        }
         OutputFormat::Parquet => unreachable!("Parquet handled before row iteration"),
     }
 }
 
-/// Print one row per line, taking the first column's value verbatim.
-/// The query is expected to have collapsed every selected col into a single
-/// TEXT column (via `to_csv` / `to_json`), so we only ever read column 0.
-fn print_raw_lines(rows: &[Vec<Value>]) -> Result<()> {
+fn stream_ndjson(cols: &[String], rows: &mut duckdb::Rows<'_>, ncols: usize) -> Result<()> {
     let stdout = io::stdout();
-    let mut out = stdout.lock();
-    for r in rows {
+    let mut h = stdout.lock();
+    while let Some(row) = rows.next()? {
+        // Re-using one buffer per row keeps allocations bounded — important
+        // when streaming millions of rows.
+        let mut r = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            r.push(row.get::<usize, Value>(i).unwrap_or(Value::Null));
+        }
+        let line = serde_json::to_string(&row_to_json(cols, &r))?;
+        writeln!(h, "{}", line)?;
+    }
+    Ok(())
+}
+
+fn stream_csv(cols: &[String], rows: &mut duckdb::Rows<'_>, ncols: usize) -> Result<()> {
+    let stdout = io::stdout();
+    let mut h = stdout.lock();
+    writeln!(h, "{}", cols.join(","))?;
+    while let Some(row) = rows.next()? {
+        let mut cells: Vec<String> = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            let v = row.get::<usize, Value>(i).unwrap_or(Value::Null);
+            cells.push(value_to_csv(&v));
+        }
+        writeln!(h, "{}", cells.join(","))?;
+    }
+    Ok(())
+}
+
+fn stream_raw_lines(rows: &mut duckdb::Rows<'_>) -> Result<()> {
+    let stdout = io::stdout();
+    let mut h = stdout.lock();
+    while let Some(row) = rows.next()? {
         // value_to_display already turns NULL → "∅"; for raw-lines we want
         // empty string instead so awk/jq pipelines don't see junk.
-        let line = match r.first() {
-            Some(Value::Null) | None => String::new(),
-            Some(v) => value_to_display(v),
+        let line = match row.get::<usize, Value>(0).unwrap_or(Value::Null) {
+            Value::Null => String::new(),
+            v => value_to_display(&v),
         };
-        writeln!(out, "{line}")?;
+        writeln!(h, "{}", line)?;
     }
     Ok(())
 }
@@ -184,27 +227,6 @@ fn print_table(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
 fn print_json(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
     let arr: Vec<JsonValue> = rows.iter().map(|r| row_to_json(cols, r)).collect();
     println!("{}", serde_json::to_string_pretty(&JsonValue::Array(arr))?);
-    Ok(())
-}
-
-fn print_ndjson(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
-    let stdout = io::stdout();
-    let mut h = stdout.lock();
-    for r in rows {
-        let line = serde_json::to_string(&row_to_json(cols, r))?;
-        writeln!(h, "{}", line)?;
-    }
-    Ok(())
-}
-
-fn print_csv(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
-    let stdout = io::stdout();
-    let mut h = stdout.lock();
-    writeln!(h, "{}", cols.join(","))?;
-    for r in rows {
-        let cells: Vec<String> = r.iter().map(value_to_csv).collect();
-        writeln!(h, "{}", cells.join(","))?;
-    }
     Ok(())
 }
 
