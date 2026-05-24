@@ -419,7 +419,8 @@ pq -o csv sales.parquet '.email, .country' \
   | pq -i csv - '.country | distinct'
 
 # Mix with jq / awk freely — everything pq emits is line-oriented.
-pq events.parquet '.user_id, .ts | to_ndjson' \
+# (pq's `to_json` already emits one JSON object per row — that's ndjson.)
+pq events.parquet '.user_id, .ts | to_json' \
   | jq -c 'select(.ts > "2026-01-01")' \
   | pq -i ndjson - 'count'
 ```

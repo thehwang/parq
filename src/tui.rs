@@ -2569,7 +2569,7 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
             "  left_join \"b\" on .a.id == .b.uid     — LEFT/RIGHT/FULL",
         )),
         Line::from(Span::raw(
-            "  to_csv  /  to_json                    — line per row",
+            "  to_csv / to_json (= to_ndjson)        — line per row",
         )),
         Line::from(""),
         Line::from(Span::styled(

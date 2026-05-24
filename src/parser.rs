@@ -656,11 +656,19 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
     // Per-row line output stages: bare `to_csv` / `to_json` (no args).
     // These must be the LAST stage in a query — anything after is silently
     // ignored (well, parsed but the SELECT list collapse happens regardless).
+    //
+    // Aliases (v0.9.1):
+    // * `to_tsv` → tab-less CSV is rare in practice; intentionally NOT an alias
+    //   for to_csv (different separator), keep them distinct.
+    // * `to_ndjson` / `to_jsonl` → both are unix-world names for what pq's
+    //   `to_json` already emits (one JSON object per row, newline-delimited).
+    //   Added because `to_ndjson` is what users intuitively reach for when
+    //   chaining `pq | jq | pq -i ndjson -`.
     if lower == "to_csv" || lower == "tocsv" {
         plan.line_format = Some(LineFormat::Csv);
         return Ok(());
     }
-    if lower == "to_json" || lower == "tojson" {
+    if lower == "to_json" || lower == "tojson" || lower == "to_ndjson" || lower == "to_jsonl" {
         plan.line_format = Some(LineFormat::Json);
         return Ok(());
     }
@@ -1283,6 +1291,23 @@ mod tests {
             s.contains("SELECT to_json(__pq_inner) AS line FROM ("),
             "got: {}",
             s
+        );
+    }
+
+    #[test]
+    fn to_ndjson_and_to_jsonl_alias_to_json() {
+        // v0.9.1 ergonomic aliases — the unix world reaches for "ndjson"
+        // and "jsonl" by reflex when chaining `pq | jq | pq -i ndjson -`.
+        // Both must compile to the exact same SQL as `to_json`.
+        let baseline = cmp("u.parquet", ".email, .country | to_json", 20);
+        let ndjson = cmp("u.parquet", ".email, .country | to_ndjson", 20);
+        let jsonl = cmp("u.parquet", ".email, .country | to_jsonl", 20);
+        assert_eq!(baseline, ndjson, "to_ndjson should alias to_json");
+        assert_eq!(baseline, jsonl, "to_jsonl should alias to_json");
+        let out = compile_plan("u.parquet", "to_ndjson", 0).unwrap();
+        assert!(
+            out.raw_lines,
+            "to_ndjson must set raw_lines so the renderer skips header/quoting"
         );
     }
 
