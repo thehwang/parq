@@ -1,7 +1,26 @@
 // Output rendering: pretty TUI table for terminals, JSON / NDJSON / CSV / Parquet for pipes.
 
 use anyhow::{Context, Result};
-use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
+use comfy_table::{Cell, ContentArrangement, Table};
+
+/// Custom preset: pure single-line box drawing.
+///
+/// Comfy-table's stock UTF8_FULL/UTF8_FULL_CONDENSED presets use `┆` (dashed
+/// vertical) between cells and `╞═╪╡` (heavy/double-line) for the header
+/// separator. Several macOS fonts don't render those glyphs at the expected
+/// width, which makes rows look staggered or misaligned in the terminal.
+/// We mirror DuckDB's CLI: only `│ ─ ┌ ┐ ├ ┤ ┬ ┴ ┼` — a charset every
+/// modern terminal/font handles uniformly.
+///
+/// Field order (from comfy_table::style::presets): left, right, bottom, top,
+/// header_left, header_line, header_intersect, header_right, vertical,
+/// horizontal, intersect, intersect_left, intersect_right, top_intersect,
+/// bottom_intersect, top_left, top_right, bottom_left, bottom_right.
+///
+/// Spaces at indices 9–12 mean "don't draw the row separator inside the
+/// body" — same behaviour as comfy_table's `*_CONDENSED` presets, so we
+/// only get a single line between header and data and clean rows below.
+const PQ_TABLE_PRESET: &str = "││──├─┼┤│    ┬┴┌┐└┘";
 use duckdb::types::Value;
 use duckdb::Connection;
 use serde_json::{Map, Value as JsonValue};
@@ -147,7 +166,7 @@ fn run_parquet(conn: &Connection, sql: &str) -> Result<()> {
 fn print_table(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL_CONDENSED)
+        .load_preset(PQ_TABLE_PRESET)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(cols.iter().map(Cell::new));
 
@@ -223,8 +242,8 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Text(s) => JsonValue::String(s.clone()),
         Value::Blob(b) => JsonValue::String(format!("<blob {} bytes>", b.len())),
         Value::Date32(d) => JsonValue::String(date32_to_iso(*d)),
-        Value::Time64(_, t) => JsonValue::String(format!("time({})", t)),
-        Value::Timestamp(_, t) => JsonValue::String(format!("timestamp({})", t)),
+        Value::Time64(unit, t) => JsonValue::String(time_to_iso(*unit, *t)),
+        Value::Timestamp(unit, t) => JsonValue::String(timestamp_to_iso(*unit, *t)),
         // v0.10: nested types render as proper JSON arrays / objects so the
         // chain idiom (`pq f.parquet '.events' | jq ... | pq -i ndjson -`)
         // works without raw-SQL escape hatches. Before this change we fell
@@ -262,6 +281,68 @@ fn value_to_json(v: &Value) -> JsonValue {
     }
 }
 
+/// Split a TIMESTAMP/TIME tick count into (whole_seconds, sub_second_nanos)
+/// based on its `TimeUnit`. `div_euclid`/`rem_euclid` keep negative inputs
+/// well-behaved (the alternative truncates toward zero, which gives a
+/// nonsensical "negative nanos" for pre-epoch timestamps).
+fn split_unit(unit: duckdb::types::TimeUnit, value: i64) -> (i64, i64) {
+    use duckdb::types::TimeUnit::*;
+    match unit {
+        Second => (value, 0),
+        Millisecond => (value.div_euclid(1_000), value.rem_euclid(1_000) * 1_000_000),
+        Microsecond => (
+            value.div_euclid(1_000_000),
+            value.rem_euclid(1_000_000) * 1_000,
+        ),
+        Nanosecond => (
+            value.div_euclid(1_000_000_000),
+            value.rem_euclid(1_000_000_000),
+        ),
+    }
+}
+
+/// Format sub-second nanos as `.fff…` with trailing zeros stripped, or
+/// empty string when nanos == 0. Pulls the conditional out of the call
+/// sites so the timestamp formatter stays readable.
+fn format_fractional(nanos: i64) -> String {
+    if nanos == 0 {
+        String::new()
+    } else {
+        let s = format!("{nanos:09}");
+        let trimmed = s.trim_end_matches('0');
+        format!(".{trimmed}")
+    }
+}
+
+/// Convert a Parquet/DuckDB `TIMESTAMP` (TimeUnit + tick count since
+/// 1970-01-01 UTC) to ISO 8601 `YYYY-MM-DDTHH:MM:SS[.fff]`. No timezone
+/// suffix — DuckDB's plain TIMESTAMP is wall-clock (naive); rendering a
+/// Z would be a lie. Pre-epoch values render correctly thanks to
+/// `div_euclid`/`rem_euclid` plus the proleptic-Gregorian `date32_to_iso`.
+fn timestamp_to_iso(unit: duckdb::types::TimeUnit, value: i64) -> String {
+    let (secs, nanos) = split_unit(unit, value);
+    let days = secs.div_euclid(86_400) as i32;
+    let secs_of_day = secs.rem_euclid(86_400);
+    let h = secs_of_day / 3_600;
+    let m = (secs_of_day % 3_600) / 60;
+    let s = secs_of_day % 60;
+    let date = date32_to_iso(days);
+    let frac = format_fractional(nanos);
+    format!("{date}T{h:02}:{m:02}:{s:02}{frac}")
+}
+
+/// Convert a `TIME` value (tick count *within* a day, no date component) to
+/// `HH:MM:SS[.fff]`. We don't take a modulo because legitimate TIME values
+/// always live in `[0, 86_400_000_000_000)` for nanos — DuckDB enforces this.
+fn time_to_iso(unit: duckdb::types::TimeUnit, value: i64) -> String {
+    let (secs, nanos) = split_unit(unit, value);
+    let h = secs / 3_600;
+    let m = (secs % 3_600) / 60;
+    let s = secs % 60;
+    let frac = format_fractional(nanos);
+    format!("{h:02}:{m:02}:{s:02}{frac}")
+}
+
 /// Convert days since 1970-01-01 (parquet/arrow Date32 representation) to
 /// "YYYY-MM-DD". Implements Howard Hinnant's `civil_from_days` algorithm —
 /// proleptic Gregorian, no external date library needed.
@@ -279,7 +360,11 @@ fn date32_to_iso(days: i32) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn value_to_display(v: &Value) -> String {
+/// Single-cell display string for a DuckDB Value. Shared with the TUI
+/// (which used to ship its own copy missing TIMESTAMP / nested-type
+/// handling) so date/struct/list rendering stays consistent across all
+/// output paths.
+pub(crate) fn value_to_display(v: &Value) -> String {
     match v {
         Value::Null => "∅".to_string(),
         Value::Text(s) => s.clone(),
@@ -298,6 +383,8 @@ fn value_to_display(v: &Value) -> String {
         Value::UBigInt(i) => i.to_string(),
         Value::Blob(b) => format!("<blob {} bytes>", b.len()),
         Value::Date32(d) => date32_to_iso(*d),
+        Value::Time64(unit, t) => time_to_iso(*unit, *t),
+        Value::Timestamp(unit, t) => timestamp_to_iso(*unit, *t),
         // v0.10: nested types render as compact JSON in tables/CSV so they
         // sit cleanly in a single cell. We reuse value_to_json to get the
         // structural representation, then serde_json's compact serializer.
@@ -329,6 +416,54 @@ mod tests {
     #[test]
     fn date32_unix_epoch_zero() {
         assert_eq!(date32_to_iso(0), "1970-01-01");
+    }
+
+    #[test]
+    fn timestamp_micros_renders_iso() {
+        // 2026-01-01 17:00:00 UTC = 1_767_286_800 seconds since epoch.
+        // duckdb's default TIMESTAMP is microsecond precision.
+        let micros = 1_767_286_800_i64 * 1_000_000;
+        assert_eq!(
+            timestamp_to_iso(duckdb::types::TimeUnit::Microsecond, micros),
+            "2026-01-01T17:00:00"
+        );
+    }
+
+    #[test]
+    fn timestamp_with_subsecond_strips_trailing_zeros() {
+        // 1970-01-01T00:00:00.123 — millisecond precision, fractional part
+        // should render as `.123` (not `.123000` or `.123000000`).
+        assert_eq!(
+            timestamp_to_iso(duckdb::types::TimeUnit::Millisecond, 123),
+            "1970-01-01T00:00:00.123"
+        );
+        // nanosecond precision keeps full precision when it's there.
+        assert_eq!(
+            timestamp_to_iso(duckdb::types::TimeUnit::Nanosecond, 123_456_789),
+            "1970-01-01T00:00:00.123456789"
+        );
+    }
+
+    #[test]
+    fn timestamp_pre_epoch_handles_borrow_correctly() {
+        // 1969-12-31T23:59:59 — one second before epoch. Naive `secs / 86400`
+        // truncates-toward-zero gives day=0 with secs_of_day=-1, which would
+        // render as 1970-01-01T-1 nonsense. The Euclidean split yields
+        // (-1 day, 86399 secs) → 1969-12-31T23:59:59, the right answer.
+        assert_eq!(
+            timestamp_to_iso(duckdb::types::TimeUnit::Second, -1),
+            "1969-12-31T23:59:59"
+        );
+    }
+
+    #[test]
+    fn time_renders_iso_no_date() {
+        // 14:30:00 in microseconds = 14*3600 + 30*60 = 52_200 seconds
+        let micros = 52_200_i64 * 1_000_000;
+        assert_eq!(
+            time_to_iso(duckdb::types::TimeUnit::Microsecond, micros),
+            "14:30:00"
+        );
     }
 
     #[test]

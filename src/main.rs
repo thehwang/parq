@@ -93,36 +93,81 @@ struct Cli {
     command: Option<Cmd>,
 }
 
+// ── Subcommand-local flags ───────────────────────────────────────────────────
+//
+// Why every subcommand re-declares `-i input`: clap's
+// `args_conflicts_with_subcommands` (set on `Cli`) makes parent-level flags
+// disable subcommand routing — without that flag `pq f.parquet 'count'`
+// would route to `Cmd::Count` and bomb on a missing file. We need the
+// flag to keep that idiom working. The price is that parent flags can't
+// be combined with a subcommand at all (clap silently drops to positional
+// parsing instead, which is how `pq -i ndjson schema FILE` used to mis-
+// parse `schema` as the file). Putting `-i` directly on each subcommand
+// is the standard escape hatch — same pattern kubectl/docker subcommands
+// use. Flags-after-subcommand-name reads naturally; the user's tab-
+// completion learns it instantly.
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Show parquet schema as a table.
-    Schema { file: String },
+    Schema {
+        file: String,
+        /// Input format (auto | parquet | ndjson | csv).
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
+    },
     /// Per-column min / max / null / distinct stats.
-    Stats { file: String },
+    Stats {
+        file: String,
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
+    },
     /// Random sample of N rows.
     Sample {
         file: String,
         #[arg(short, long, default_value_t = 10)]
         n: usize,
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
     },
     /// First N rows.
     Head {
         file: String,
         #[arg(short, long, default_value_t = 20)]
         n: usize,
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
     },
     /// Last N rows.
     Tail {
         file: String,
         #[arg(short, long, default_value_t = 20)]
         n: usize,
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
     },
     /// Total row count.
-    Count { file: String },
+    Count {
+        file: String,
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
+    },
     /// Interactive TUI: 4-panel browser (Columns / Filters / editable Query / live Data).
     /// On exit, prints the equivalent `pq` CLI one-liner so you can copy it
     /// into a shell history, Makefile, or cron job. (v0.5 MVP)
-    Tui { file: String },
+    Tui {
+        file: String,
+        /// Input format for the file (auto | parquet | ndjson | csv).
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
+        /// Cap on rows shown in the Data panel. Default 50; honored when set.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        n: usize,
+        /// SQL macro to register before the session. Repeatable.
+        /// Format: `name(args) := body` (the `:=` is rewritten to SQL `AS`).
+        #[arg(long = "udf", value_name = "MACRO")]
+        udfs: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -208,7 +253,7 @@ fn run_query(cli: &Cli, conn: &Connection, fmt: OutputFormat) -> Result<()> {
 ///   `name(args) AS body`         — DuckDB native; passed through verbatim
 ///   anything else                — wrapped as `CREATE MACRO <input>` and
 ///                                  whatever DuckDB makes of it is the error.
-fn register_udfs(conn: &Connection, udfs: &[String]) -> Result<()> {
+pub(crate) fn register_udfs(conn: &Connection, udfs: &[String]) -> Result<()> {
     for raw in udfs {
         let body = raw.trim();
         // Tolerate users wrapping their macro body in `CREATE MACRO ...` or not.
@@ -260,31 +305,45 @@ pub(crate) fn open_conn() -> Result<Connection> {
     Ok(conn)
 }
 
-fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) -> Result<()> {
+fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -> Result<()> {
     // The TUI takes over the terminal — handle it before we build any SQL.
-    if let Cmd::Tui { file } = cmd {
+    if let Cmd::Tui {
+        file,
+        input,
+        n,
+        udfs,
+    } = cmd
+    {
         // Hand the TUI its own connection so it owns the duckdb session.
         // Cheap (in-memory db, ~50 ms) and cleaner than threading a borrow
-        // through ratatui's event-loop closures.
+        // through ratatui's event-loop closures. Re-register UDFs on the
+        // fresh connection so `--udf … tui f.parquet` works (without this
+        // the macros lived only on the parent `conn`).
         let tui_conn = open_conn()?;
+        register_udfs(&tui_conn, udfs)?;
         let _ = conn; // explicit acknowledgement that we don't reuse `conn`
-        return tui::run(tui_conn, file.clone());
+        let input_fmt = resolve_input_format(input, file)?;
+        // `-n` is the user's preview-row cap. Subcommand-level default is
+        // 50 (TUI's historical preview height); we floor at 1 to avoid an
+        // empty viewport.
+        let preview_limit = (*n).max(1);
+        return tui::run(tui_conn, file.clone(), input_fmt, preview_limit, udfs.clone());
     }
 
-    // v0.9: subcommands also get stdin-spool + format dispatch. Pull out
-    // the file from the matched variant, resolve, then build SQL against
-    // the resolved path. The spool guard must outlive the read — keep it
-    // bound for the whole match arm.
-    let raw_file = match cmd {
-        Cmd::Schema { file }
-        | Cmd::Stats { file }
-        | Cmd::Sample { file, .. }
-        | Cmd::Head { file, .. }
-        | Cmd::Tail { file, .. }
-        | Cmd::Count { file } => file.clone(),
+    // v0.9: subcommands also get stdin-spool + format dispatch. Each
+    // variant carries its own `-i input`, so the resolution lives inline
+    // here and we don't reach into the parent `Cli` for flags (which
+    // can't be combined with a subcommand under our clap config anyway).
+    let (raw_file, input_str) = match cmd {
+        Cmd::Schema { file, input }
+        | Cmd::Stats { file, input }
+        | Cmd::Sample { file, input, .. }
+        | Cmd::Head { file, input, .. }
+        | Cmd::Tail { file, input, .. }
+        | Cmd::Count { file, input } => (file.clone(), input.as_str()),
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
     };
-    let input_fmt = resolve_input_format(&cli.input, &raw_file)?;
+    let input_fmt = resolve_input_format(input_str, &raw_file)?;
     let spool = StdinSpool::resolve(&raw_file, input_fmt)?;
     let src = parser::source_clause_fmt(&spool.resolved, input_fmt);
 

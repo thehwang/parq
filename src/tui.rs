@@ -56,11 +56,16 @@ use ratatui::Terminal;
 use tui_textarea::TextArea;
 
 use crate::lineage::{self, Lineage};
+use crate::output::value_to_display;
 use crate::parser;
+use crate::source::InputFormat;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-const PREVIEW_LIMIT: usize = 50;
+/// Default cap on the preview pane's row count when the user didn't pass
+/// `-n`. Keeping the panel bounded keeps the render path snappy on huge
+/// remote files; users wanting more rows pass `pq tui -n 500 file.parquet`.
+const PREVIEW_LIMIT_DEFAULT: usize = 50;
 const SQL_THROTTLE: Duration = Duration::from_millis(50);
 /// Cap on persisted query history. 100 entries fits ~10 KB on disk;
 /// browsing 100 is already too many — anyone wanting more should
@@ -112,8 +117,12 @@ struct ColumnInfo {
     selected: bool,
 }
 
-fn fetch_schema(conn: &Connection, file: &str) -> Result<Vec<ColumnInfo>> {
-    let src = parser::source_clause(file);
+fn fetch_schema(conn: &Connection, file: &str, fmt: InputFormat) -> Result<Vec<ColumnInfo>> {
+    // v0.11: route through the format-aware reader so `pq tui -i ndjson f.ndjson`
+    // and `pq tui -i csv f.csv` get the right `read_json` / `read_csv_auto`.
+    // Before this the schema panel was hard-wired to read_parquet and would
+    // silently throw a binder error on non-parquet sources.
+    let src = parser::source_clause_fmt(file, fmt);
     let sql = format!("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {src})");
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
@@ -136,7 +145,7 @@ fn fetch_schema(conn: &Connection, file: &str) -> Result<Vec<ColumnInfo>> {
 struct Preview {
     /// Column headers from the most recent successful query.
     headers: Vec<String>,
-    /// Up to PREVIEW_LIMIT rows; each cell is preformatted text.
+    /// Up to `App::preview_limit` rows; each cell is preformatted text.
     rows: Vec<Vec<String>>,
     /// Compiled SQL (for the `:` SQL viewer).
     sql: String,
@@ -216,9 +225,20 @@ struct ScanInfo {
     files_read: Option<u64>,
 }
 
-fn run_preview(conn: &Connection, file: &str, query: &str) -> Preview {
+fn run_preview(
+    conn: &Connection,
+    file: &str,
+    query: &str,
+    fmt: InputFormat,
+    preview_limit: usize,
+) -> Preview {
     let started = Instant::now();
-    let plan = match parser::compile_plan(file, query, PREVIEW_LIMIT) {
+    // v0.11: format-aware compile so non-parquet sources work. Without
+    // this the TUI built `read_parquet('foo.ndjson')` and the user got
+    // a binder error in the Query panel header — the same query worked
+    // fine from the CLI because main.rs already routes through
+    // compile_plan_fmt.
+    let plan = match parser::compile_plan_fmt(file, query, preview_limit, fmt) {
         Ok(p) => p,
         Err(e) => {
             return Preview {
@@ -231,7 +251,7 @@ fn run_preview(conn: &Connection, file: &str, query: &str) -> Preview {
     // Cheap to wrap; DuckDB's optimizer collapses double LIMITs.
     let sql_with_cap = format!(
         "SELECT * FROM ({}) AS __pq_tui_preview LIMIT {}",
-        plan.sql, PREVIEW_LIMIT
+        plan.sql, preview_limit
     );
 
     let mut stmt = match conn.prepare(&sql_with_cap) {
@@ -260,12 +280,15 @@ fn run_preview(conn: &Connection, file: &str, query: &str) -> Preview {
         .unwrap_or_default();
     let ncols = headers.len();
 
-    let mut rows = Vec::with_capacity(PREVIEW_LIMIT);
+    let mut rows = Vec::with_capacity(preview_limit);
     while let Ok(Some(row)) = rows_iter.next() {
         let mut cells = Vec::with_capacity(ncols);
         for i in 0..ncols {
             let v: Value = row.get(i).unwrap_or(Value::Null);
-            cells.push(value_to_string(&v));
+            // v0.11: use the shared output::value_to_display so TIMESTAMP /
+            // STRUCT / LIST / MAP cells render as ISO strings / compact JSON
+            // instead of Rust Debug output (`Timestamp(Microsecond, …)` etc.).
+            cells.push(value_to_display(&v));
         }
         rows.push(cells);
     }
@@ -604,35 +627,28 @@ fn extract_hive_keys(path: &str) -> Vec<String> {
     out
 }
 
-/// Stripped-down version of output::value_to_display — duplicated here to keep
-/// the TUI module self-contained (output.rs has terminal-rendering deps that
-/// don't make sense inside ratatui).
-fn value_to_string(v: &Value) -> String {
-    match v {
-        Value::Null => "∅".into(),
-        Value::Text(s) => s.clone(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Float(f) => format!("{f}"),
-        Value::Double(f) => format!("{f}"),
-        Value::Decimal(d) => d.to_string(),
-        Value::TinyInt(i) => i.to_string(),
-        Value::SmallInt(i) => i.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::BigInt(i) => i.to_string(),
-        Value::HugeInt(i) => i.to_string(),
-        Value::UTinyInt(i) => i.to_string(),
-        Value::USmallInt(i) => i.to_string(),
-        Value::UInt(i) => i.to_string(),
-        Value::UBigInt(i) => i.to_string(),
-        Value::Blob(b) => format!("<blob {} bytes>", b.len()),
-        other => format!("{other:?}"),
-    }
-}
+// (TUI used to ship its own `value_to_string` here — a stripped-down copy of
+// output::value_to_display. v0.11 unified them: TIMESTAMP / TIME / nested
+// types render the same in `pq` and `pq tui`. The shared implementation
+// lives in `output.rs` so adding a new type rendering only touches one place.)
 
 // ─── App state ───────────────────────────────────────────────────────────────
 
 struct App<'ta> {
     file: String,
+    /// Input format passed in from the CLI (`-i parquet|ndjson|csv`, sniffed
+    /// from extension if `auto`). Threaded into `compile_plan_fmt` /
+    /// `source_clause_fmt` so non-parquet inputs DTRT in the schema panel,
+    /// preview, and EXPLAIN/ANALYZE worker.
+    input_fmt: InputFormat,
+    /// Cap on rows shown in the Data panel; from `-n` (default
+    /// PREVIEW_LIMIT_DEFAULT). Also doubles as the LIMIT injected when the
+    /// user's query has no explicit limit.
+    preview_limit: usize,
+    /// `--udf` macro definitions captured from the CLI. Re-registered on
+    /// every fresh DuckDB connection (the main one + every ANALYZE worker)
+    /// so user-defined functions referenced in queries always resolve.
+    udfs: Vec<String>,
     columns: Vec<ColumnInfo>,
     column_state: ListState,
     query: TextArea<'ta>,
@@ -731,8 +747,14 @@ struct Completion {
 }
 
 impl<'ta> App<'ta> {
-    fn new(file: String, conn: &Connection) -> Result<Self> {
-        let columns = fetch_schema(conn, &file)?;
+    fn new(
+        file: String,
+        conn: &Connection,
+        input_fmt: InputFormat,
+        preview_limit: usize,
+        udfs: Vec<String>,
+    ) -> Result<Self> {
+        let columns = fetch_schema(conn, &file, input_fmt)?;
         let mut column_state = ListState::default();
         if !columns.is_empty() {
             column_state.select(Some(0));
@@ -746,13 +768,16 @@ impl<'ta> App<'ta> {
         // something to delete-and-replace instead of staring at a blank.
         query.set_placeholder_text(QUERY_PLACEHOLDER);
         query.set_placeholder_style(Style::default().fg(Color::DarkGray));
-        // Default: show first 20 rows (same as bare `pq file.parquet`).
-        // We leave the textarea empty, which compile_plan() expands into
-        // `SELECT * FROM ... LIMIT 20`.
+        // Default: show first preview_limit rows. We leave the textarea
+        // empty; compile_plan_fmt expands an empty query into
+        // `SELECT * FROM ... LIMIT preview_limit`.
 
-        let preview = run_preview(conn, &file, "");
+        let preview = run_preview(conn, &file, "", input_fmt, preview_limit);
         Ok(Self {
             file,
+            input_fmt,
+            preview_limit,
+            udfs,
             columns,
             column_state,
             query,
@@ -794,6 +819,9 @@ impl<'ta> App<'ta> {
         query.set_placeholder_style(Style::default().fg(Color::DarkGray));
         Self {
             file: file.into(),
+            input_fmt: InputFormat::Parquet,
+            preview_limit: PREVIEW_LIMIT_DEFAULT,
+            udfs: Vec::new(),
             columns,
             column_state,
             query,
@@ -909,6 +937,13 @@ impl<'ta> App<'ta> {
         let plan_sql = self.preview.sql.clone();
         let file = self.file.clone();
         let query = self.current_query_text();
+        // v0.11: snapshot the user's --udf list into the worker so its
+        // fresh connection re-registers the macros before running
+        // EXPLAIN ANALYZE. Without this, queries that reference a UDF
+        // would compile in the main TUI session but fail in the
+        // analyze worker with a "Catalog Error" — confusing because
+        // the user can see the same SQL working in the data panel.
+        let udfs = self.udfs.clone();
         thread::spawn(move || {
             // Each thread owns its own connection — created lazily on
             // entry, dropped at scope exit. This is also where the
@@ -918,6 +953,13 @@ impl<'ta> App<'ta> {
             let Ok(conn) = crate::open_conn() else {
                 return;
             };
+            if let Err(_e) = crate::register_udfs(&conn, &udfs) {
+                // Macro registration failure is rare (would have caught
+                // it on session start). Bail silently — the analyze
+                // worker's empty-result path falls back to the main
+                // panel's existing error state.
+                return;
+            }
             if let Some(summary) = run_analyze(&conn, &plan_sql, &file, &query) {
                 // tx.send returns Err when the receiver was dropped
                 // (user pressed Esc to cancel). That's expected — we
@@ -967,12 +1009,30 @@ impl<'ta> App<'ta> {
     }
 
     fn equivalent_cli(&self) -> String {
+        // v0.11: include `-i ndjson|csv` and `-n N` in the printed one-liner
+        // when the TUI was launched with non-default values, so copy-pasting
+        // the CLI into a shell reproduces what the user is looking at on
+        // screen — not a parquet-only / 20-row-default approximation.
         let q = self.current_query_text();
-        if q.trim().is_empty() {
-            format!("pq {}", shell_quote(&self.file))
-        } else {
-            format!("pq {} {}", shell_quote(&self.file), shell_quote(&q))
+        let mut parts = vec!["pq".to_string()];
+        match self.input_fmt {
+            InputFormat::Parquet => {} // default, omit
+            InputFormat::Ndjson => parts.extend(["-i".into(), "ndjson".into()]),
+            InputFormat::Csv => parts.extend(["-i".into(), "csv".into()]),
         }
+        if self.preview_limit != PREVIEW_LIMIT_DEFAULT {
+            parts.push("-n".into());
+            parts.push(self.preview_limit.to_string());
+        }
+        for udf in &self.udfs {
+            parts.push("--udf".into());
+            parts.push(shell_quote(udf));
+        }
+        parts.push(shell_quote(&self.file));
+        if !q.trim().is_empty() {
+            parts.push(shell_quote(&q));
+        }
+        parts.join(" ")
     }
 
     fn schedule_compile(&mut self) {
@@ -989,7 +1049,13 @@ impl<'ta> App<'ta> {
             if Instant::now() >= deadline {
                 let q = self.current_query_text();
                 if q != self.last_compiled {
-                    self.preview = run_preview(conn, &self.file, &q);
+                    self.preview = run_preview(
+                        conn,
+                        &self.file,
+                        &q,
+                        self.input_fmt,
+                        self.preview_limit,
+                    );
                     self.last_compiled = q.clone();
                     // Record successful (non-empty, non-error) queries
                     // in history. We don't gate on preview.error — even
@@ -1682,12 +1748,21 @@ fn render_columns(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
         })
         .collect();
 
+    // Title surfaces the input format whenever it isn't the default
+    // (parquet) — useful confirmation when the user opened a `.ndjson`
+    // / `.csv` file or passed `-i` explicitly. Hidden for parquet to
+    // keep the title compact in the common case.
+    let fmt_tag = match app.input_fmt {
+        InputFormat::Parquet => "",
+        InputFormat::Ndjson => " · ndjson",
+        InputFormat::Csv => " · csv",
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(focused_style(active))
-                .title(format!(" Columns · {} ", app.columns.len())),
+                .title(format!(" Columns · {}{} ", app.columns.len(), fmt_tag)),
         )
         .highlight_style(
             Style::default()
@@ -1795,13 +1870,23 @@ fn render_sql(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
 
 fn render_data(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
     let active = app.focus == Panel::Data;
+    // Title hint: report `cap=N` whenever the row count hits the LIMIT
+    // we injected — that's the user's signal that more data exists and
+    // they can pass `pq tui -n 200 …` to widen the window. We deliberately
+    // don't compute true row counts here because that would force a
+    // second SELECT count(*) per keystroke on remote files.
+    let cap_hint = if app.preview.rows.len() >= app.preview_limit {
+        format!(" (cap={})", app.preview_limit)
+    } else {
+        String::new()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focused_style(active))
         .title(format!(
-            " Data · {} of {} rows shown ",
+            " Data · {} rows{} ",
             app.preview.rows.len(),
-            app.preview.rows.len() // honest about the cap; v0.6 counts true rows
+            cap_hint
         ));
 
     if app.preview.headers.is_empty() {
@@ -2545,31 +2630,51 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
             "  .col, .col2                           — projection",
         )),
         Line::from(Span::raw(
-            "  where .a > 18                         — filter",
+            "  .col where .a > 18                    — inline where",
+        )),
+        Line::from(Span::raw(
+            "  where .a > 18                         — filter stage",
         )),
         Line::from(Span::raw(
             "  group_by .country | count             — count per group",
         )),
         Line::from(Span::raw(
-            "  group_by .c | sum .rev                — sum per group",
+            "  group_by .c | sum .rev | having sum_rev > 1k",
         )),
         Line::from(Span::raw(
-            "  top 10 by sum_rev                     — order desc + limit",
+            "  count_distinct .user_id               — uniq aggregate",
         )),
         Line::from(Span::raw(
-            "  sort by .rev desc | limit 5           — explicit",
+            "  top 10 by sum_rev / sort by .rev desc / limit 5",
         )),
         Line::from(Span::raw(
             "  distinct                              — SELECT DISTINCT",
         )),
         Line::from(Span::raw(
-            "  join \"b.parquet\" on .id              — INNER join",
+            "  join \"b.parquet\" on .id              — INNER (also left_/right_/full_join)",
         )),
         Line::from(Span::raw(
-            "  left_join \"b\" on .a.id == .b.uid     — LEFT/RIGHT/FULL",
+            "  to_csv / to_json (= to_ndjson, to_jsonl)  — line per row",
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Nested paths (v0.10) + chained UNNEST (v0.11)", bold)),
+        Line::from(Span::raw(
+            "  .events[0].kind                       — list index, jq 0-idx",
         )),
         Line::from(Span::raw(
-            "  to_csv / to_json (= to_ndjson)        — line per row",
+            "  .events[-1].kind                      — last element",
+        )),
+        Line::from(Span::raw(
+            "  .events[].kind                        — UNNEST (chains in any clause)",
+        )),
+        Line::from(Span::raw(
+            "  .metadata[\"plan\"]                    — MAP key access",
+        )),
+        Line::from(Span::raw(
+            "  len(.tags), keys(.m), values(.m)      — collection helpers",
+        )),
+        Line::from(Span::raw(
+            "  group_by .events[].kind | count       — UNNEST + agg",
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -2612,9 +2717,22 @@ fn centered_rect(pct_x: u16, pct_y: u16, outer: Rect) -> Rect {
 
 // ─── Main entry ──────────────────────────────────────────────────────────────
 
-pub fn run(conn: Connection, file: String) -> Result<()> {
+pub fn run(
+    conn: Connection,
+    file: String,
+    input_fmt: InputFormat,
+    preview_limit: usize,
+    udfs: Vec<String>,
+) -> Result<()> {
+    // Make sure raw mode + alt screen are restored even if the app panics
+    // mid-render. Without this, a panic unwinds past `teardown_terminal`
+    // and leaves the user's terminal in raw mode (no \n→\r\n translation),
+    // which makes every subsequent `pq` table output look diagonally
+    // staggered until they run `stty sane`.
+    install_panic_hook();
+
     let mut terminal = setup_terminal().context("failed to enter alternate screen")?;
-    let mut app = App::new(file, &conn)?;
+    let mut app = App::new(file, &conn, input_fmt, preview_limit, udfs)?;
 
     let result = run_app(&mut terminal, &mut app, &conn);
 
@@ -2679,10 +2797,27 @@ fn setup_terminal() -> Result<Tui> {
 }
 
 fn teardown_terminal(t: &mut Tui) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    t.show_cursor()?;
+    // Best-effort: keep going even if one step errors so we never leave
+    // the terminal half-restored. `disable_raw_mode` is the single most
+    // important call — without it, the user's shell will mis-render every
+    // subsequent multi-line command's output.
+    let _ = disable_raw_mode();
+    let _ = execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = t.show_cursor();
     Ok(())
+}
+
+/// Replace the default panic hook with one that restores the terminal
+/// before printing the panic message. We do this for the whole process —
+/// `pq tui` is a one-shot subcommand, so swapping the hook globally is
+/// fine.
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original(info);
+    }));
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -3515,6 +3650,119 @@ TABLE_SCAN
             .first()
             .unwrap()
             .ends_with(&format!("{}", HISTORY_MAX + 9)));
+    }
+
+    // ── v0.11: CLI round-trip when the TUI was launched with `-i` / `-n` /
+    //   `--udf`. Y / Q exits print this string; users paste it back into a
+    //   shell, and it must reconstruct the exact same session. Previously
+    //   we dropped the format and limit, so a TUI that was reading an
+    //   `.ndjson` would print `pq f.ndjson '...'` — which `pq` would then
+    //   sniff back as parquet from the extension... usually. The test
+    //   pins explicit -i emission so that fragile heuristic doesn't get
+    //   used as the contract.
+
+    #[test]
+    fn equivalent_cli_omits_defaults() {
+        let app = App::for_test("demo.parquet", Vec::new(), Preview::default());
+        assert_eq!(app.equivalent_cli(), "pq demo.parquet");
+    }
+
+    #[test]
+    fn equivalent_cli_includes_input_format_for_ndjson() {
+        let mut app = App::for_test("demo.ndjson", Vec::new(), Preview::default());
+        app.input_fmt = InputFormat::Ndjson;
+        // No query yet — still emit `-i ndjson` so paste-back doesn't fall
+        // through to extension sniffing (which happens to agree here, but
+        // the format flag is the source of truth in the TUI session).
+        assert_eq!(app.equivalent_cli(), "pq -i ndjson demo.ndjson");
+    }
+
+    #[test]
+    fn equivalent_cli_includes_csv_and_n() {
+        let mut app = App::for_test("data.csv", Vec::new(), Preview::default());
+        app.input_fmt = InputFormat::Csv;
+        app.preview_limit = 200;
+        app.query.insert_str("where .age > 18");
+        let cli = app.equivalent_cli();
+        assert!(
+            cli.starts_with("pq -i csv -n 200 "),
+            "expected csv+n prefix, got {cli}"
+        );
+        assert!(cli.ends_with("'where .age > 18'"), "got {cli}");
+    }
+
+    #[test]
+    fn equivalent_cli_threads_udfs() {
+        let mut app = App::for_test("demo.parquet", Vec::new(), Preview::default());
+        app.udfs = vec![
+            "is_us(c) := c = 'US'".to_string(),
+            "shout(s) := upper(s)".to_string(),
+        ];
+        let cli = app.equivalent_cli();
+        // Both --udf flags must show up, single-quoted because the body
+        // contains spaces and `=`. We don't pin exact ordering because
+        // shell_quote escapes interact with the user's macro contents
+        // — match on substring so the test stays useful when shell_quote
+        // changes its escape strategy.
+        assert!(
+            cli.contains("--udf 'is_us(c) := c = '\\''US'\\'''"),
+            "missing first udf in {cli}"
+        );
+        assert!(cli.contains("--udf 'shout(s) := upper(s)'"), "missing second udf in {cli}");
+    }
+
+    // ── v0.11: schema fetch + preview compile route through the format,
+    //   so non-parquet TUI sessions DTRT. We test against an in-memory
+    //   DuckDB connection because the bug we fixed (always reading
+    //   parquet) only manifests at SQL-compile time.
+
+    #[test]
+    fn fetch_schema_uses_format_for_ndjson() {
+        // Write a tiny ndjson fixture, ask the TUI's schema fetcher to
+        // describe it. Before v0.11 this synthesized read_parquet() and
+        // duckdb's binder rejected the call; now it picks read_json.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.ndjson");
+        std::fs::write(&path, "{\"a\":1,\"b\":\"x\"}\n{\"a\":2,\"b\":\"y\"}\n").unwrap();
+        let conn = Connection::open_in_memory().expect("open conn");
+        let cols = fetch_schema(
+            &conn,
+            path.to_str().unwrap(),
+            InputFormat::Ndjson,
+        )
+        .expect("schema");
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn run_preview_uses_format_for_ndjson() {
+        // End-to-end: ndjson source + a typical DSL stage (where + count).
+        // Validates that compile_plan_fmt is on the hot path and the
+        // generated SQL hits read_json, not read_parquet.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.ndjson");
+        std::fs::write(
+            &path,
+            "{\"country\":\"US\"}\n{\"country\":\"DE\"}\n{\"country\":\"US\"}\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().expect("open conn");
+        let preview = run_preview(
+            &conn,
+            path.to_str().unwrap(),
+            "where .country == \"US\" | count",
+            InputFormat::Ndjson,
+            50,
+        );
+        assert!(preview.error.is_none(), "preview errored: {:?}", preview.error);
+        assert!(
+            preview.sql.contains("read_json("),
+            "expected read_json in compiled sql, got: {}",
+            preview.sql
+        );
+        assert_eq!(preview.headers, vec!["count".to_string()]);
+        assert_eq!(preview.rows, vec![vec!["2".to_string()]]);
     }
 }
 

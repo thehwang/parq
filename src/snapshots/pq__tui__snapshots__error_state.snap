@@ -1,6 +1,6 @@
 ---
 source: src/tui.rs
-assertion_line: 3719
+assertion_line: 3827
 ---
 ┌ Columns · 3 ─────────────┐┌ Query · ⚠ parse: unknown column .nope ───────────────────────────────┐
 │▶ ★ id  BIGINT            ││.nope                                                                 │
@@ -8,7 +8,7 @@ assertion_line: 3719
 │    revenue  DOUBLE       ││                                                                      │
 │                          ││                                                                      │
 │                          │└──────────────────────────────────────────────────────────────────────┘
-│                          │┌ Data · 0 of 0 rows shown ────────────────────────────────────────────┐
+│                          │┌ Data · 0 rows ───────────────────────────────────────────────────────┐
 │                          ││error:                                                                │
 │                          ││  parse: unknown column .nope                                         │
 │                          ││                                                                      │

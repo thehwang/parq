@@ -540,7 +540,35 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.5.1** (current)
+**v0.11.1** (current)
+- [x] Custom single-line table preset — clean `│ ─ ┌ ┐` charset (DuckDB-CLI style),
+      replaces `UTF8_FULL_CONDENSED`'s exotic `┆ ╞ ═ ╪ ╡` glyphs that some macOS
+      fonts mis-rendered and made tables look diagonally staggered
+- [x] TUI installs a panic hook + best-effort `teardown_terminal` — a panic in
+      the event loop no longer leaves your shell in raw mode after `pq tui`
+      exits (the symptom was every subsequent multi-line command rendering
+      stair-stepped until you ran `stty sane`)
+- [x] Cargo.toml version finally tracks the git tag — `pq --version` shows the
+      real release number, no more lag
+
+**v0.11**
+- [x] Chained UNNEST sugar: `.events[].kind` works in `select / where / group_by /
+      having / order_by` — full LIST<STRUCT> path navigation in any clause
+- [x] `count_distinct(.x)`, multi-arg aggregates, and `top N by` interplay with
+      chained-UNNEST aliases
+
+**v0.10**
+- [x] Nested schema as a first-class citizen — `value_to_json` recurses into
+      LIST / STRUCT / MAP, so JSON / NDJSON output round-trips cleanly
+- [x] Path tokens accept `[N]` (jq 0-indexed → DuckDB 1-indexed), `[]`, `["key"]`,
+      `len(.foo)`, `.foo | length`, `keys(.foo)`
+- [x] Function-style projections (`keys(.metadata)`) parse as projections, not
+      WHERE filters
+- [x] Per-subcommand `-i/--input`, `-n`, `--udf` flags — `pq tui -i ndjson FILE`
+      now parses correctly (was a clap `args_conflicts_with_subcommands` quirk)
+- [x] Timestamps render as ISO-8601 strings, not `timestamp(<micros>)` debug
+
+**v0.5.1**
 - [x] S3 `credential_chain` fallback — `AWS_PROFILE`, `~/.aws/credentials`, SSO,
       EC2 IMDS, and ECS task role now Just Work without setting `AWS_ACCESS_KEY_ID`
 

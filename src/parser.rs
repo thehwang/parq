@@ -627,6 +627,12 @@ impl QueryPlan {
 /// Compile a pq DSL query to DuckDB SQL plus a "raw lines" hint flag for
 /// the renderer. Defaults to parquet input — the historical behaviour.
 /// Use `compile_plan_fmt` to feed in ndjson/csv stdin chains (v0.9).
+///
+/// The wrapper has no production callers as of v0.11 (everything routes
+/// through `compile_plan_fmt`) but the parser test suite still leans on
+/// the parquet-default shorthand — keeping the function avoids touching
+/// dozens of `cmp(...)` test helpers for zero behavior change.
+#[allow(dead_code)]
 pub fn compile_plan(file: &str, query: &str, default_limit: usize) -> Result<CompileOutput> {
     compile_plan_fmt(file, query, default_limit, InputFormat::Parquet)
 }
@@ -928,7 +934,21 @@ fn parse_stage(stage: &str, plan: &mut QueryPlan) -> Result<()> {
     }
 
     // Bare projection or projection-with-inline-where (v0 syntax).
-    if s.starts_with('.') {
+    //
+    // Triggered when the stage starts with `.` (jq-style path) OR when the
+    // stage is shaped as a recognised path-function call: `len(.events)`,
+    // `keys(.metadata)`, `values(.metadata)`, `length(.tags)`. Without the
+    // path-function arm a bare `keys(.metadata)` would fall through to the
+    // "last resort" filter branch and emit `WHERE keys(metadata)` — DuckDB
+    // tries to evaluate that as a boolean and explodes with "Catalog Error:
+    // Scalar Function with name keys does not exist", because the WHERE
+    // path doesn't go through `rewrite_path_function`. Routing the same
+    // syntax through projection lets parse_projection do the rewrite.
+    let path_fn_proj = rewrite_path_function(s).is_some()
+        || split_inline_where(s)
+            .map(|(p, _)| rewrite_path_function(p).is_some())
+            .unwrap_or(false);
+    if s.starts_with('.') || path_fn_proj {
         if let Some((proj_part, filter_part)) = split_inline_where(s) {
             let cols = parse_projection(proj_part)?;
             plan.projections
@@ -2264,6 +2284,33 @@ mod tests {
         assert!(s.contains("_pq_u0.kind AS events_kind"));
         assert!(s.contains("GROUP BY _pq_u0.kind"));
         assert!(s.contains("count(*) AS count"));
+    }
+
+    #[test]
+    fn bare_path_function_routes_to_projection() {
+        // Regression for tutorial L2.3: `keys(.metadata)` as a stand-alone
+        // stage used to fall through `parse_stage`'s last-resort branch and
+        // emit `WHERE map_keys(metadata)` — DuckDB then complained the
+        // function didn't exist, because the WHERE path doesn't run path
+        // rewrites. Now bare path-function calls reach `parse_projection`,
+        // which routes through `rewrite_path_function` and aliases the
+        // result.
+        let s = cmp("f.parquet", "keys(.metadata)", 0);
+        assert!(
+            s.contains("SELECT map_keys(metadata)"),
+            "keys(.metadata) should project map_keys(): {}",
+            s
+        );
+        assert!(
+            !s.contains("WHERE"),
+            "keys() alone shouldn't synthesize a WHERE: {}",
+            s
+        );
+        // `len(.events)` and `values(.metadata)` exercise the same arm.
+        assert!(cmp("f.parquet", "len(.events)", 0).contains("SELECT len(events)"));
+        assert!(
+            cmp("f.parquet", "values(.metadata)", 0).contains("SELECT map_values(metadata)")
+        );
     }
 
     #[test]
