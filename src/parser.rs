@@ -96,7 +96,14 @@ pub fn source_clause_fmt(file: &str, fmt: InputFormat) -> String {
 /// `sum_b.amount` is invalid SQL — DuckDB parses the dot as a struct accessor.
 /// Replace any non-identifier character with `_` to keep the alias parseable.
 pub(crate) fn alias_safe(col: &str) -> String {
-    col.chars()
+    // v0.11: aggregates over chained-UNNEST paths used to render as
+    // `sum_UNNEST_events__amount` because alias_safe just turned every
+    // non-identifier byte into `_`. Strip the `UNNEST(<inner>)` wrapper
+    // first so the alias reads like the user's original path:
+    //   `UNNEST(events).amount` → strip → `events.amount` → `events_amount`
+    let stripped = strip_unnest_wrappers(col);
+    stripped
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
                 c
@@ -104,7 +111,38 @@ pub(crate) fn alias_safe(col: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect::<String>()
+        // collapse runs of `_` (e.g. from `).` after stripping) so we
+        // don't end up with double underscores in the alias.
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Recursively strip `UNNEST(<inner>)` wrappers so e.g.
+/// `UNNEST(UNNEST(matrix).row).cell` becomes `matrix.row.cell`. Used by
+/// alias generation so chained-unnest aggregates and projections get
+/// human-readable column names.
+fn strip_unnest_wrappers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !prev_is_ident && i + 7 <= bytes.len() && s[i..i + 7].eq_ignore_ascii_case("UNNEST(") {
+            let open = i + 6;
+            if let Some(close) = match_paren(s, open) {
+                let inner = &s[open + 1..close];
+                out.push_str(&strip_unnest_wrappers(inner));
+                i = close + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Given a column expression, return the name DuckDB will assign to the
@@ -135,6 +173,106 @@ fn strip_as_alias(expr: &str) -> String {
     } else {
         expr.trim().to_string()
     }
+}
+
+// ─── chained UNNEST hoister (v0.11) ──────────────────────────────────────────
+//
+// pq's path tokenizer happily emits `UNNEST(events).kind` for `.events[].kind`,
+// which reads naturally but DuckDB rejects in two situations that bite real
+// queries:
+//   1. SELECT list with same-level GROUP BY  → "UNNEST not supported here"
+//   2. WHERE/ORDER BY/HAVING                 → same error
+// The fix is uniform: lift every `UNNEST(...)` from the outer SELECT into a
+// derived FROM subquery that does the row-explosion once, alias each unnest
+// expression `_pq_u<i>`, and rewrite the outer fragments to reference those
+// aliases. Cost: one extra SELECT layer per query that uses `[]`. Benefit:
+// `.events[].kind` works in projection, where, group_by, sort_by uniformly.
+//
+// We dedupe on the inner expression so `.events[].kind` and `.events[].amount`
+// share `_pq_u0` rather than producing two independent unnests of the same
+// list (which would multiply rows incorrectly).
+
+/// Find the matching `)` for the `(` at byte index `open` in `s`, ignoring
+/// parens inside SQL string literals. Returns `None` if unbalanced.
+fn match_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes[open], b'(');
+    let mut depth = 1usize;
+    let mut i = open + 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !in_double && b == b'\'' {
+            in_single = !in_single;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+        }
+        if !in_single && !in_double {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Walk `fragment` and replace every chained `UNNEST(<expr>)` (one followed
+/// by `.`, `[`, or sitting in a context that needs lifting) with an alias
+/// drawn from / appended to `sources`. Bare terminal `UNNEST(<expr>)` (i.e.
+/// the entire SELECT item is `UNNEST(events)` with nothing after) is left
+/// alone — that form already works in DuckDB and rewriting it churns the
+/// SQL diff on every test.
+///
+/// `force_lift` overrides the "only when chained" rule for clauses where
+/// terminal UNNEST is also illegal — namely WHERE / GROUP BY / HAVING /
+/// ORDER BY. (DuckDB allows `SELECT UNNEST(x)` but not
+/// `WHERE UNNEST(x) IS NOT NULL`.)
+fn lift_unnest(fragment: &str, sources: &mut Vec<(String, String)>, force_lift: bool) -> String {
+    let bytes = fragment.as_bytes();
+    let mut out = String::with_capacity(fragment.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Match "UNNEST(" case-insensitively, but only when the preceding
+        // char isn't an identifier byte (so we don't munge `MY_UNNEST(`).
+        let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let starts_unnest = i + 7 <= bytes.len()
+            && fragment[i..i + 7].eq_ignore_ascii_case("UNNEST(")
+            && !prev_is_ident;
+        if starts_unnest {
+            let open = i + 6;
+            if let Some(close) = match_paren(fragment, open) {
+                let inner = fragment[open + 1..close].trim().to_string();
+                let next = bytes.get(close + 1).copied();
+                let chained = matches!(next, Some(b'.') | Some(b'['));
+                if chained || force_lift {
+                    let alias = match sources.iter().find(|(e, _)| e == &inner) {
+                        Some((_, a)) => a.clone(),
+                        None => {
+                            let a = format!("_pq_u{}", sources.len());
+                            sources.push((inner, a.clone()));
+                            a
+                        }
+                    };
+                    out.push_str(&alias);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Heuristic: does the path contain at least one `name=value` directory segment?
@@ -283,25 +421,6 @@ impl QueryPlan {
         !self.aggregates.is_empty() || !self.group_by.is_empty()
     }
 
-    /// What ends up after SELECT, BEFORE any line_format wrapping.
-    fn select_list(&self) -> String {
-        if self.has_grouping() {
-            let mut parts: Vec<String> = self.group_by.clone();
-            for a in &self.aggregates {
-                parts.push(a.sql());
-            }
-            if parts.is_empty() {
-                "*".into()
-            } else {
-                parts.join(", ")
-            }
-        } else if !self.projections.is_empty() {
-            self.projections.join(", ")
-        } else {
-            "*".into()
-        }
-    }
-
     /// Final column NAMES (i.e. how rows are addressed *after* the inner SELECT
     /// runs). Used by line-output wrapping to build the outer column refs.
     /// Returns an empty Vec if the projection is `*` — caller decides whether
@@ -333,51 +452,116 @@ impl QueryPlan {
 
     /// SQL for the underlying data pipeline (projections, joins, filters,
     /// grouping, ordering, limit) — without any line-format wrapping.
+    ///
+    /// v0.11: every fragment runs through `lift_unnest`, which collects
+    /// chained-UNNEST expressions into a shared `unnest_sources` list and
+    /// rewrites them to reference an alias `_pq_u<i>`. If anything got
+    /// lifted, the FROM clause becomes a derived table that does the
+    /// unnesting once. This is the single place where chained `[]` becomes
+    /// legal DuckDB.
     fn to_sql_core(&self) -> String {
+        let mut unnest_sources: Vec<(String, String)> = Vec::new();
+
+        // SELECT list — UNNEST in projection without grouping is fine for
+        // DuckDB *if it's terminal*; chained UNNEST always needs lifting.
+        // We only force-lift in clauses where DuckDB rejects every UNNEST.
+        let lifted_projections: Vec<String> = self
+            .projections
+            .iter()
+            .map(|p| lift_unnest(p, &mut unnest_sources, false))
+            .collect();
+        let lifted_aggregates: Vec<String> = self
+            .aggregates
+            .iter()
+            .map(|a| lift_unnest(&a.sql(), &mut unnest_sources, false))
+            .collect();
+        let lifted_group_by: Vec<String> = self
+            .group_by
+            .iter()
+            .map(|g| lift_unnest(g, &mut unnest_sources, false))
+            .collect();
+        // WHERE / HAVING / ORDER BY: DuckDB rejects bare UNNEST here too,
+        // so force-lift even non-chained occurrences.
+        let lifted_filters: Vec<String> = self
+            .filters
+            .iter()
+            .map(|f| lift_unnest(f, &mut unnest_sources, true))
+            .collect();
+        let lifted_havings: Vec<String> = self
+            .havings
+            .iter()
+            .map(|h| lift_unnest(h, &mut unnest_sources, true))
+            .collect();
+        let lifted_order_by: Vec<(String, bool)> = self
+            .order_by
+            .iter()
+            .map(|(c, asc)| (lift_unnest(c, &mut unnest_sources, true), *asc))
+            .collect();
+
+        // Build the FROM expression. If anything was lifted, wrap the
+        // original source (and any join) in a derived table that does the
+        // unnesting once. We re-export everything from the inner source
+        // via `*` plus the new alias columns, so outer references like
+        // `country` and `_pq_u0.kind` both resolve.
+        let from_expr = self.build_from_clause();
+        let final_from = if unnest_sources.is_empty() {
+            from_expr
+        } else {
+            let unnest_cols: Vec<String> = unnest_sources
+                .iter()
+                .map(|(expr, alias)| format!("UNNEST({}) AS {}", expr, alias))
+                .collect();
+            format!(
+                "(SELECT *, {} FROM {}) AS _pq_src",
+                unnest_cols.join(", "),
+                from_expr
+            )
+        };
+
+        // Rebuild the SELECT list from lifted fragments (mirrors
+        // `select_list()` but uses the lifted vectors so we don't double-
+        // recompute).
+        let select_list = if self.has_grouping() {
+            let mut parts: Vec<String> = lifted_group_by.clone();
+            parts.extend(lifted_aggregates);
+            if parts.is_empty() {
+                "*".into()
+            } else {
+                parts.join(", ")
+            }
+        } else if !lifted_projections.is_empty() {
+            lifted_projections.join(", ")
+        } else {
+            "*".into()
+        };
+
         let mut sql = String::with_capacity(128);
         sql.push_str("SELECT ");
         if self.distinct {
             sql.push_str("DISTINCT ");
         }
-        sql.push_str(&self.select_list());
+        sql.push_str(&select_list);
         sql.push_str(" FROM ");
-        sql.push_str(&self.source);
+        sql.push_str(&final_from);
 
-        // Join (INNER/LEFT/RIGHT/FULL OUTER), single equi-condition, aliases left=a / right=b.
-        if let Some(j) = &self.join {
-            sql.push_str(" AS a ");
-            sql.push_str(j.kind.sql());
-            sql.push(' ');
-            sql.push_str(&j.right_source);
-            sql.push_str(" AS b ON ");
-            sql.push_str(&j.on_expr);
-        }
-
-        if !self.filters.is_empty() {
+        if !lifted_filters.is_empty() {
             sql.push_str(" WHERE ");
-            sql.push_str(&self.filters.join(" AND "));
+            sql.push_str(&lifted_filters.join(" AND "));
         }
-        if !self.group_by.is_empty() {
+        if !lifted_group_by.is_empty() {
             // GROUP BY can take either the bare expression OR the alias,
             // but NOT `expr AS alias` — that's a parse error in DuckDB.
-            // self.group_by stores the SELECT-list form (with alias) so
-            // that `final_col_name` and the outer SELECT keep working;
-            // strip the alias here for the GROUP BY emission. Examples:
-            //   `country`                          → `country`
-            //   `payer_zipped[1].type_coverage AS payer_zipped_0_type_coverage`
-            //                                      → `payer_zipped[1].type_coverage`
             sql.push_str(" GROUP BY ");
-            let bare: Vec<String> = self.group_by.iter().map(|g| strip_as_alias(g)).collect();
+            let bare: Vec<String> = lifted_group_by.iter().map(|g| strip_as_alias(g)).collect();
             sql.push_str(&bare.join(", "));
         }
-        if !self.havings.is_empty() {
+        if !lifted_havings.is_empty() {
             sql.push_str(" HAVING ");
-            sql.push_str(&self.havings.join(" AND "));
+            sql.push_str(&lifted_havings.join(" AND "));
         }
-        if !self.order_by.is_empty() {
+        if !lifted_order_by.is_empty() {
             sql.push_str(" ORDER BY ");
-            let parts: Vec<String> = self
-                .order_by
+            let parts: Vec<String> = lifted_order_by
                 .iter()
                 .map(|(c, asc)| format!("{} {}", c, if *asc { "ASC" } else { "DESC" }))
                 .collect();
@@ -387,6 +571,25 @@ impl QueryPlan {
             sql.push_str(&format!(" LIMIT {n}"));
         }
         sql
+    }
+
+    /// The `<source> [AS a JOIN <right> AS b ON ...]` portion. Pulled out
+    /// so `to_sql_core` can wrap it in a derived table when chained UNNEST
+    /// hoisting kicks in. (Named `build_from_clause` rather than
+    /// `from_clause` to dodge clippy's `wrong_self_convention` rule, which
+    /// reads `from_*` as constructor-only.)
+    fn build_from_clause(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&self.source);
+        if let Some(j) = &self.join {
+            s.push_str(" AS a ");
+            s.push_str(j.kind.sql());
+            s.push(' ');
+            s.push_str(&j.right_source);
+            s.push_str(" AS b ON ");
+            s.push_str(&j.on_expr);
+        }
+        s
     }
 
     /// Wrap the inner pipeline in an outer SELECT that collapses each row to a
@@ -918,15 +1121,11 @@ fn tokenize_path(path: &str) -> Result<Vec<PathSegment>> {
         }
     }
 
-    // [] must be last.
-    if let Some(pos) = out.iter().position(|s| matches!(s, PathSegment::Unnest)) {
-        if pos != out.len() - 1 {
-            return Err(anyhow!(
-                "[] (UNNEST) must be the last segment of a path; got '{}'",
-                path
-            ));
-        }
-    }
+    // v0.11 allows `[]` to appear mid-path. The lifter in `to_sql_core`
+    // hoists every `UNNEST(...)` (whether terminal or chained) into a
+    // derived FROM subquery so DuckDB never sees `UNNEST` in a context
+    // where it complains ("UNNEST not supported here"). Tokenizer no
+    // longer needs to enforce terminal-only.
 
     Ok(out)
 }
@@ -1270,15 +1469,21 @@ fn rewrite_filter(input: &str) -> String {
                 let end = scan_path_end(&chars, i);
                 let raw: String = chars[i..end].iter().collect();
                 match path_to_sql(&raw) {
-                    Ok(rewritten) if !rewritten.starts_with("UNNEST(") => {
+                    Ok(rewritten) => {
+                        // v0.11: UNNEST inside WHERE is now legal — the
+                        // hoister in `to_sql_core` rewrites `UNNEST(...)`
+                        // into a `_pq_u<i>` alias and lifts the actual
+                        // unnest into a derived FROM. So just emit the
+                        // path's SQL form here verbatim and let the
+                        // lifter handle the rest.
                         s.push_str(&rewritten);
                         i = end;
                         continue;
                     }
                     _ => {
-                        // UNNEST inside WHERE doesn't make sense — just
-                        // drop the dot and let DuckDB produce a clearer
-                        // error than we can.
+                        // Path tokenizer choked — fall back to the legacy
+                        // "drop the dot" behaviour so we don't surprise
+                        // existing queries that lean on it.
                         i += 1;
                         continue;
                     }
@@ -1820,10 +2025,24 @@ mod tests {
     }
 
     #[test]
-    fn path_unnest_must_be_last() {
-        // `.events[].kind` is ambiguous (UNNEST then field-of-row vs
-        // list_transform) — punt to v0.11; reject it cleanly for now.
-        assert!(path_to_sql(".events[].kind").is_err());
+    fn path_chained_unnest_renders_inline() {
+        // v0.11: tokenizer no longer rejects mid-path `[]`. `path_to_sql`
+        // emits the literal `UNNEST(...).suffix` form; the lifter in
+        // `to_sql_core` is what hoists it into a derived FROM. Verifying
+        // the path-level emission keeps that contract testable in
+        // isolation.
+        assert_eq!(
+            path_to_sql(".events[].kind").unwrap(),
+            "UNNEST(events).kind"
+        );
+        assert_eq!(
+            path_to_sql(".events[].user.id").unwrap(),
+            "UNNEST(events).user.id"
+        );
+        assert_eq!(
+            path_to_sql(".matrix[][]").unwrap(),
+            "UNNEST(UNNEST(matrix))"
+        );
     }
 
     #[test]
@@ -2009,17 +2228,71 @@ mod tests {
     }
 
     #[test]
-    fn projection_path_error_propagates() {
-        // `.events[].kind` is illegal (UNNEST must be terminal). We used
-        // to silently drop the leading dot and let DuckDB barf on the
-        // raw `[]` — now pq surfaces a clear "invalid path" error.
-        let err = compile_plan("f.parquet", ".events[].kind", 0).unwrap_err();
-        let msg = format!("{}", err);
+    fn projection_chained_unnest_lifts_to_subquery() {
+        // v0.11: `.events[].kind` compiles by hoisting `UNNEST(events)`
+        // into a derived FROM. The outer SELECT references `_pq_u0.kind`;
+        // DuckDB never sees raw UNNEST in the outer context where it
+        // would complain.
+        let s = cmp("f.parquet", ".events[].kind", 0);
         assert!(
-            msg.contains("invalid path") && msg.contains(".events[].kind"),
-            "expected friendly path error, got: {}",
-            msg
+            s.contains("UNNEST(events) AS _pq_u0"),
+            "missing inner unnest projection: {}",
+            s
         );
+        assert!(
+            s.contains("_pq_u0.kind"),
+            "outer SELECT should reference alias.field: {}",
+            s
+        );
+        // Outer SELECT must NOT contain UNNEST anymore (it's all hoisted).
+        let outer = s.split(" FROM ").next().unwrap();
+        assert!(
+            !outer.contains("UNNEST"),
+            "outer SELECT should be UNNEST-free: {}",
+            outer
+        );
+    }
+
+    #[test]
+    fn group_by_chained_unnest_compiles() {
+        // The shape that triggered the original v0.11 ask:
+        // `group_by .events[].kind | count` previously failed with
+        // DuckDB's "UNNEST not supported here". Now it must produce a
+        // well-formed SELECT whose GROUP BY references `_pq_u0.kind`.
+        let s = cmp("f.parquet", "group_by .events[].kind | count", 0);
+        assert!(s.contains("UNNEST(events) AS _pq_u0"));
+        assert!(s.contains("_pq_u0.kind AS events_kind"));
+        assert!(s.contains("GROUP BY _pq_u0.kind"));
+        assert!(s.contains("count(*) AS count"));
+    }
+
+    #[test]
+    fn shared_unnest_source_dedupes() {
+        // `.events[].kind, .events[].amount` should NOT produce two
+        // independent unnests of `events` (which would yield N*N rows).
+        // The lifter dedupes on the inner expression so both columns
+        // share `_pq_u0`.
+        let s = cmp("f.parquet", ".events[].kind, .events[].amount", 0);
+        assert_eq!(
+            s.matches("UNNEST(events) AS _pq_u0").count(),
+            1,
+            "should emit exactly one UNNEST(events) in inner: {}",
+            s
+        );
+        assert!(
+            !s.contains("_pq_u1"),
+            "should not allocate a 2nd alias: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn where_with_chained_unnest_compiles() {
+        // WHERE emits force-lift, so even chained UNNEST in a filter
+        // routes through the inner subquery.
+        let s = cmp("f.parquet", "where .events[].kind == \"click\"", 0);
+        assert!(s.contains("UNNEST(events) AS _pq_u0"));
+        assert!(s.contains("WHERE _pq_u0.kind = 'click'"));
     }
 
     #[test]

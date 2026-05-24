@@ -396,9 +396,9 @@ filter_expr  := <DuckDB SQL fragment>            -- with sugar:
                   bare .col → col
 ```
 
-## Nested schema (v0.10)
+## Nested schema (v0.10) + chained UNNEST (v0.11)
 
-Parquet's everyday nested types (`LIST`, `STRUCT`, `MAP`) are now first
+Parquet's everyday nested types (`LIST`, `STRUCT`, `MAP`) are first
 class. The renderer emits proper JSON for them, and the DSL gained
 jq-style bracket sugar so you don't have to drop into raw SQL:
 
@@ -409,17 +409,57 @@ jq-style bracket sugar so you don't have to drop into raw SQL:
 | `.tags[-1]` | `tags[-1]` | last element (DuckDB native) |
 | `.tags[]` | `UNNEST(tags) AS tags` | row explosion — projection only |
 | `.events[0].kind` | `events[1].kind` | LIST&lt;STRUCT&gt; — index then field |
+| `.events[].kind` | `_pq_u0.kind` (with hoisted FROM) | **v0.11** — chained UNNEST, see below |
 | `.metadata["plan"]` | `element_at(metadata, 'plan')[1]` | MAP value lookup |
 | `len(.tags)` | `len(tags)` | length |
 | `keys(.metadata)` | `map_keys(metadata)` | MAP keys |
 | `values(.metadata)` | `map_values(metadata)` | MAP values |
+
+### Chained UNNEST (v0.11)
+
+`.events[].kind` reads "explode the events array, then take `.kind` of
+each row". DuckDB rejects raw `UNNEST(events).kind` in any clause that
+also has `GROUP BY` / `WHERE` / `HAVING` / `ORDER BY` — the dreaded
+`Binder Error: UNNEST not supported here`. v0.11 fixes that uniformly:
+every chained `UNNEST(...)` is hoisted into a derived FROM subquery
+and rewritten to a `_pq_u<i>` alias, so the outer SELECT only ever
+sees plain columns.
+
+```bash
+# group_by + count + sort, with row explosion. Just works in v0.11.
+pq events.parquet 'group_by .events[].kind | count | sort by .count desc'
+# {"events_kind":"click","count":2}
+# {"events_kind":"buy","count":1}
+
+# sum across exploded rows
+pq events.parquet 'group_by .events[].kind | sum .events[].amount'
+# {"events_kind":"buy","sum_events_amount":9.0}
+# {"events_kind":"click","sum_events_amount":2.0}
+
+# WHERE on a chained UNNEST — also lifted, also legal.
+pq events.parquet 'where .events[].kind == "click" | .user_id, .events[].amount'
+
+# Repeated references to the same exploded list share one UNNEST,
+# so `.events[].kind, .events[].amount` produces N rows (not N²).
+pq events.parquet '.events[].kind, .events[].amount'
+```
+
+The compiled SQL is visible via `--explain` if you want to confirm
+the lifting:
+
+```sql
+SELECT _pq_u0.kind AS events_kind, count(*) AS count
+FROM (SELECT *, UNNEST(events) AS _pq_u0 FROM read_parquet('events.parquet')) AS _pq_src
+GROUP BY _pq_u0.kind
+ORDER BY count DESC
+```
 
 ```bash
 # Real example — events.parquet has events: LIST<STRUCT(kind, amount)>
 pq events.parquet '.user_id, .events[0].kind, .events[0].amount'
 # {"user_id":1,"events_0_kind":"click","events_0_amount":1.0}
 
-# Row-explode an array column
+# Row-explode a scalar array column
 pq events.parquet '.user_id, .events[]'
 # {"user_id":1,"events":{"kind":"click","amount":1.0}}
 # {"user_id":1,"events":{"kind":"buy","amount":9.0}}
@@ -436,9 +476,9 @@ JSON output preserves projection order (the JSON object keys appear in
 the order you wrote in the SELECT list, top-level and nested) — useful
 when downstream code makes positional assumptions.
 
-For anything `pq`'s sugar doesn't cover (correlated UNNEST, list
-comprehensions, complex MAP filters), the raw SQL escape hatch is
-always available:
+For anything `pq`'s sugar doesn't cover (list comprehensions, complex
+MAP filters, list_filter / list_transform with lambdas), the raw SQL
+escape hatch is always available:
 
 ```bash
 pq events.parquet 'SELECT user_id, list_filter(events, e -> e.amount > 5) AS big FROM FILE'
