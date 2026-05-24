@@ -6,3 +6,5 @@
 .idea/
 .vscode/
 Cargo.lock.bak
+# Local design notes — stay on disk, never pushed.
+/design/

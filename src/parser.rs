@@ -38,25 +38,54 @@
 
 use anyhow::{anyhow, Result};
 
+use crate::source::InputFormat;
+
 // ─── Source ──────────────────────────────────────────────────────────────────
 
-/// Wrap a path/URI into a DuckDB FROM-clause-friendly source expression.
+/// Wrap a path/URI into a DuckDB FROM-clause-friendly source expression
+/// for the parquet default. Kept as a thin wrapper for callers that don't
+/// know about input formats yet (notably the test suite — every existing
+/// snapshot test predates the v0.9 InputFormat plumb).
+pub fn source_clause(file: &str) -> String {
+    source_clause_fmt(file, InputFormat::Parquet)
+}
+
+/// Format-aware source clause. Picks the right DuckDB reader:
+///
+/// * Parquet: `read_parquet('path' [, hive_partitioning=true])`
+/// * NDJSON:  `read_json('path', format='newline_delimited', auto_detect=true)`
+/// * CSV:     `read_csv_auto('path')`
 ///
 /// Hive partitioning (`hive_partitioning=true`) auto-enables when the path
 /// contains a hive-style segment like `dt=2026-05-21` — this lets the user
 /// query partition columns without any flag, e.g.:
 ///   pq 'sales/dt=2026-*/region=*/*.parquet' 'group_by .dt, .region | count'
-pub fn source_clause(file: &str) -> String {
+///
+/// We only auto-detect hive for parquet because the json/csv readers
+/// don't accept the option (and partitioned ndjson/csv on disk is a
+/// vanishingly rare layout anyway).
+pub fn source_clause_fmt(file: &str, fmt: InputFormat) -> String {
     let f = file.trim();
-    if f == "-" {
-        return "read_parquet('/dev/stdin')".to_string();
-    }
     let escaped = f.replace('\'', "''");
-    let hive = looks_like_hive_partition(f);
-    if hive {
-        format!("read_parquet('{}', hive_partitioning=true)", escaped)
-    } else {
-        format!("read_parquet('{}')", escaped)
+    match fmt {
+        InputFormat::Parquet => {
+            // Stdin path is special: hive detection makes no sense on
+            // `/dev/stdin`, and we trust the caller (source::StdinSpool)
+            // to have picked the right physical path.
+            if f == "/dev/stdin" || f == "-" {
+                return "read_parquet('/dev/stdin')".to_string();
+            }
+            if looks_like_hive_partition(f) {
+                format!("read_parquet('{}', hive_partitioning=true)", escaped)
+            } else {
+                format!("read_parquet('{}')", escaped)
+            }
+        }
+        InputFormat::Ndjson => format!(
+            "read_json('{}', format='newline_delimited', auto_detect=true)",
+            escaped
+        ),
+        InputFormat::Csv => format!("read_csv_auto('{}')", escaped),
     }
 }
 
@@ -369,10 +398,23 @@ impl QueryPlan {
 
 // ─── compile_plan() ──────────────────────────────────────────────────────────
 
-/// Compile a pq DSL query to DuckDB SQL plus a "raw lines" hint flag for the
-/// renderer. Returns `CompileOutput { sql, raw_lines }`.
+/// Compile a pq DSL query to DuckDB SQL plus a "raw lines" hint flag for
+/// the renderer. Defaults to parquet input — the historical behaviour.
+/// Use `compile_plan_fmt` to feed in ndjson/csv stdin chains (v0.9).
 pub fn compile_plan(file: &str, query: &str, default_limit: usize) -> Result<CompileOutput> {
-    let src = source_clause(file);
+    compile_plan_fmt(file, query, default_limit, InputFormat::Parquet)
+}
+
+/// Format-aware compile. `fmt` selects the DuckDB `read_*` table function
+/// for the source. Joins still default to parquet for the right-hand side
+/// (mixed-format joins are an edge case we don't try to model in v0.9).
+pub fn compile_plan_fmt(
+    file: &str,
+    query: &str,
+    default_limit: usize,
+    fmt: InputFormat,
+) -> Result<CompileOutput> {
+    let src = source_clause_fmt(file, fmt);
     let q = query.trim();
 
     if q.is_empty() {

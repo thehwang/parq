@@ -6,11 +6,11 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.8:** `EXPLAIN ANALYZE` now runs off the UI thread — capital `E` returns instantly with a "running…" timer in the panel header, and `Esc` cancels mid-flight. Press `Ctrl-↑/Ctrl-↓` in the Query panel to browse persisted query history (`~/.pq/history`). Snapshot tests + a VHS smoke test guard the TUI in CI on every PR.
+> **New in v0.9 — `pq` becomes a real shell primitive.** Pipe parquet directly: `cat f.parquet | pq -` and `aws s3 cp s3://x/y - | pq -` now Just Work — pq detects a non-seekable stdin and spools to a tempfile so DuckDB's footer-trailer reader is happy. Pair with `-i ndjson` / `-i csv` to chain stages without a temp file: `pq f.parquet '.country | to_json' | pq -i ndjson - 'group_by .country | count'`.
 >
-> _v0.7: Homebrew tap (`brew install thehwang/parq/pq`) and `EXPLAIN ANALYZE` on demand. v0.6: semantic sync, schema completion, drill-down, heuristic-hint Explain panel. v0.5: the TUI itself._
+> _v0.8: async `EXPLAIN ANALYZE` (`E` returns instantly, `Esc` cancels), persisted query history (`Ctrl-↑/Ctrl-↓`), snapshot + VHS tests. v0.7: Homebrew tap (`brew install thehwang/parq/pq`). v0.6: semantic sync, schema completion, drill-down, Explain panel. v0.5: the TUI itself._
 >
-> Already on Homebrew? `brew upgrade pq` to grab v0.8.
+> Already on Homebrew? `brew upgrade pq` to grab v0.9.
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -395,6 +395,45 @@ filter_expr  := <DuckDB SQL fragment>            -- with sugar:
                   !=      → <>
                   bare .col → col
 ```
+
+## Shell primitive (v0.9)
+
+`pq` reads stdin as a first-class source so it composes with `cat`, `aws s3 cp`,
+`gsutil cp`, `kubectl logs`, and any other command that writes structured data:
+
+```bash
+# Parquet over a pipe — pq drains the non-seekable fd to a tempfile
+# automatically (DuckDB's footer-trailer reader needs random access).
+cat data.parquet | pq - 'group_by .country | count'
+
+# Stream from cloud blob storage without a local file.
+aws s3 cp s3://my-bucket/sales.parquet - | pq - 'sum .revenue'
+
+# Chain pq invocations through ndjson — self-describing schema, no
+# column-order surprises. -i ndjson tells pq to use read_json.
+pq sales.parquet '.country, .revenue | to_json' \
+  | pq -i ndjson - 'group_by .country | sum .revenue | top 5 by sum_revenue'
+
+# Or chain through CSV (use -o csv on the producer to keep the header).
+pq -o csv sales.parquet '.email, .country' \
+  | pq -i csv - '.country | distinct'
+
+# Mix with jq / awk freely — everything pq emits is line-oriented.
+pq events.parquet '.user_id, .ts | to_ndjson' \
+  | jq -c 'select(.ts > "2026-01-01")' \
+  | pq -i ndjson - 'count'
+```
+
+| Form | What pq does |
+|---|---|
+| `pq - < f.parquet` | seekable fd, reads in place (zero-copy) |
+| `cat f.parquet \| pq -` | non-seekable fd → spool to `/tmp/pq-stdin-*.parquet` |
+| `pq -i ndjson -` | stdin → spool with `.ndjson` suffix → `read_json(format='newline_delimited')` |
+| `pq -i csv -` | stdin → spool with `.csv` suffix → `read_csv_auto` |
+| `pq -i auto data.ndjson` | sniffs format from extension (default) |
+
+The spool tempfile lives in `$TMPDIR` (RAM-backed on macOS) and is deleted as
+soon as `pq` exits — no cleanup needed.
 
 ## Comparison
 

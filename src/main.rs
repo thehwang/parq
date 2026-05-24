@@ -31,10 +31,12 @@ mod cloud;
 mod lineage;
 mod output;
 mod parser;
+mod source;
 mod tui;
 
 use crate::output::OutputFormat;
-use crate::parser::compile_plan;
+use crate::parser::compile_plan_fmt;
+use crate::source::{InputFormat, StdinSpool};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,6 +61,13 @@ struct Cli {
     /// Output: auto | table | json | ndjson | csv | parquet
     #[arg(short, long, default_value = "auto")]
     output: String,
+
+    /// Input format: auto | parquet | ndjson (jsonl/json) | csv (tsv).
+    /// `auto` sniffs from file extension (.ndjson/.csv → matching reader,
+    /// otherwise parquet). For stdin (`-`) auto means parquet — pass an
+    /// explicit `-i ndjson` to chain `pq f.parquet '...' | pq -i ndjson '...'`.
+    #[arg(short = 'i', long, default_value = "auto")]
+    input: String,
 
     /// Row limit for default head; default 20. Use 0 for no limit.
     /// (Auto-disabled when -o parquet, so full exports work as expected.)
@@ -149,7 +158,7 @@ fn main() -> Result<()> {
 
 fn run_query(cli: &Cli, conn: &Connection, fmt: OutputFormat) -> Result<()> {
     if let Some(cmd) = cli.command.as_ref() {
-        return run_subcommand(conn, cmd, fmt);
+        return run_subcommand(conn, cmd, fmt, cli);
     }
 
     let file = cli
@@ -158,13 +167,24 @@ fn run_query(cli: &Cli, conn: &Connection, fmt: OutputFormat) -> Result<()> {
         .ok_or_else(|| anyhow!("a parquet file is required (try: pq <file>)"))?;
     let query = cli.query.as_deref().unwrap_or("");
 
+    // Resolve the input format: explicit --input wins, else sniff from
+    // the file extension. Stdin (`-`) defaults to parquet — that's the
+    // historical behaviour and the most common shape (`pq - < f.parquet`).
+    let input_fmt = resolve_input_format(&cli.input, file)?;
+
+    // v0.9: if the user piped a parquet file into us (`cat f.parquet | pq -`)
+    // the fd is a non-seekable pipe, which DuckDB rejects. StdinSpool drains
+    // stdin into a tempfile when needed; the spool guard lives until the
+    // end of run_query so the file is still on disk while we read it.
+    let spool = StdinSpool::resolve(file, input_fmt)?;
+
     // For parquet export, the user almost never wants the default head LIMIT.
     let effective_n = if fmt == OutputFormat::Parquet {
         0
     } else {
         cli.n
     };
-    let plan = compile_plan(file, query, effective_n)?;
+    let plan = compile_plan_fmt(&spool.resolved, query, effective_n, input_fmt)?;
 
     if cli.explain {
         println!("{}", plan.sql);
@@ -209,6 +229,20 @@ fn register_udfs(conn: &Connection, udfs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Decide the input format from the `--input` flag plus a (possibly stdin)
+/// file argument. `auto` + a real path sniffs the extension; `auto` + `-`
+/// defaults to parquet (matches the historical behaviour and the most
+/// common chain shape `pq - < f.parquet`).
+fn resolve_input_format(flag: &str, file: &str) -> Result<InputFormat> {
+    if let Some(explicit) = InputFormat::from_flag(flag)? {
+        return Ok(explicit);
+    }
+    if file == "-" {
+        return Ok(InputFormat::Parquet);
+    }
+    Ok(InputFormat::from_extension(file))
+}
+
 pub(crate) fn open_conn() -> Result<Connection> {
     let conn = Connection::open_in_memory().context("failed to open DuckDB connection")?;
     // Enable cloud httpfs for gs:// / s3:// — duckdb's httpfs is bundled with our build.
@@ -226,7 +260,7 @@ pub(crate) fn open_conn() -> Result<Connection> {
     Ok(conn)
 }
 
-fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat) -> Result<()> {
+fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) -> Result<()> {
     // The TUI takes over the terminal — handle it before we build any SQL.
     if let Cmd::Tui { file } = cmd {
         // Hand the TUI its own connection so it owns the duckdb session.
@@ -237,40 +271,44 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat) -> Result<()>
         return tui::run(tui_conn, file.clone());
     }
 
+    // v0.9: subcommands also get stdin-spool + format dispatch. Pull out
+    // the file from the matched variant, resolve, then build SQL against
+    // the resolved path. The spool guard must outlive the read — keep it
+    // bound for the whole match arm.
+    let raw_file = match cmd {
+        Cmd::Schema { file }
+        | Cmd::Stats { file }
+        | Cmd::Sample { file, .. }
+        | Cmd::Head { file, .. }
+        | Cmd::Tail { file, .. }
+        | Cmd::Count { file } => file.clone(),
+        Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
+    };
+    let input_fmt = resolve_input_format(&cli.input, &raw_file)?;
+    let spool = StdinSpool::resolve(&raw_file, input_fmt)?;
+    let src = parser::source_clause_fmt(&spool.resolved, input_fmt);
+
     let sql = match cmd {
-        Cmd::Schema { file } => format!(
+        Cmd::Schema { .. } => format!(
             "SELECT column_name, column_type, \"null\" AS nullable \
-             FROM (DESCRIBE SELECT * FROM {src})",
-            src = parser::source_clause(file)
+             FROM (DESCRIBE SELECT * FROM {src})"
         ),
-        Cmd::Stats { file } => format!(
+        Cmd::Stats { .. } => format!(
             "SELECT column_name, column_type, min, max, \
                     approx_unique AS approx_distinct, \
                     null_percentage AS null_pct \
-             FROM (SUMMARIZE SELECT * FROM {src})",
-            src = parser::source_clause(file)
+             FROM (SUMMARIZE SELECT * FROM {src})"
         ),
-        Cmd::Sample { file, n } => format!(
-            "SELECT * FROM {src} USING SAMPLE {n} ROWS",
-            src = parser::source_clause(file),
-            n = n
-        ),
-        Cmd::Head { file, n } => format!(
-            "SELECT * FROM {src} LIMIT {n}",
-            src = parser::source_clause(file),
-            n = n
-        ),
-        Cmd::Tail { file, n } => format!(
+        Cmd::Sample { n, .. } => {
+            format!("SELECT * FROM {src} USING SAMPLE {n} ROWS")
+        }
+        Cmd::Head { n, .. } => format!("SELECT * FROM {src} LIMIT {n}"),
+        Cmd::Tail { n, .. } => format!(
             "WITH t AS (SELECT *, row_number() OVER () AS __rn FROM {src}) \
              SELECT * EXCLUDE (__rn) FROM t \
-             ORDER BY __rn DESC LIMIT {n}",
-            src = parser::source_clause(file),
-            n = n
+             ORDER BY __rn DESC LIMIT {n}"
         ),
-        Cmd::Count { file } => format!(
-            "SELECT count(*) AS rows FROM {src}",
-            src = parser::source_clause(file)
-        ),
+        Cmd::Count { .. } => format!("SELECT count(*) AS rows FROM {src}"),
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
     };
 

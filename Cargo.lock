@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "pq"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1551,8 +1551,10 @@ dependencies = [
  "crossterm 0.28.1",
  "duckdb",
  "insta",
+ "libc",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tui-textarea",
 ]
 
