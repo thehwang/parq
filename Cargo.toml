@@ -1,6 +1,6 @@
 [package]
 name = "pq"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "jq for Parquet — query parquet files with a concise expression syntax"
 authors = ["Hua Wang <thehwang@users.noreply.github.com>"]

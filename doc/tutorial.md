@@ -18,6 +18,7 @@
 - [Lesson 3: Composing with the unix toolbox (5 min)](#lesson-3-composing-with-the-unix-toolbox-5-min)
 - [Lesson 4: TUI in practice (5 min)](#lesson-4-tui-in-practice-5-min)
 - [Lesson 5: Big-file mode (5 min — v0.12 + v0.13)](#lesson-5-big-file-mode-5-min--v012--v013)
+- [Lesson 6: Schema drift in CI (3 min — v0.14)](#lesson-6-schema-drift-in-ci-3-min--v014)
 - [Cheat sheet: common idioms](#cheat-sheet-common-idioms)
 - [Next steps](#next-steps)
 
@@ -36,7 +37,7 @@ brew install thehwang/parq/pq
 
 # Verify
 pq --version
-# pq 0.13.0
+# pq 0.14.0
 ```
 
 ### Build a sample parquet
@@ -659,6 +660,158 @@ pq stats --lite /tmp/big.parquet
 # Verify the spinner self-suppresses in a pipeline
 pq /tmp/big.parquet 'group_by .country | count' 2>err.log | jq .
 test ! -s err.log && echo "stderr was empty — spinner correctly silent"
+```
+
+Done? Next lesson covers `pq diff` for catching schema drift in CI,
+or jump straight to the cheat sheet.
+
+---
+
+## Lesson 6: Schema drift in CI (3 min — v0.14)
+
+> **Key idea**: `pq diff a.parquet b.parquet` compares schemas
+> column-by-column and exit-codes non-zero on drift, so it slots
+> into CI gates without scripting. v0.14 also surfaces row-group
+> pruning ratio in the TUI Explain panel — useful when tuning
+> filters on big files.
+
+### 6.1 Catch a schema drift between two files
+
+Make two slightly-different parquet files for the demo:
+
+```bash
+duckdb -c "
+COPY (SELECT 1 AS id, 'alice' AS name)
+TO '/tmp/v1.parquet' (FORMAT PARQUET);
+
+COPY (SELECT 1 AS id, 'alice' AS name, 'US' AS country)
+TO '/tmp/v2.parquet' (FORMAT PARQUET);"
+
+pq diff /tmp/v1.parquet /tmp/v2.parquet
+```
+
+```
+# Schema diff
+- a: `/tmp/v1.parquet`
+- b: `/tmp/v2.parquet`
+
+## Added (1)
+| column    | type    | nullable |
+|-----------|---------|----------|
+| `country` | VARCHAR | yes      |
+```
+
+```bash
+echo "exit code: $?"
+# exit code: 1
+```
+
+Identical schemas exit 0 with a `**No drift**` message. Drift
+exits 1, so:
+
+```bash
+if pq diff baseline.parquet candidate.parquet; then
+    echo "schema unchanged"
+else
+    echo "schema drifted — review the diff above"
+fi
+```
+
+### 6.2 JSON output for tooling
+
+```bash
+pq diff /tmp/v1.parquet /tmp/v2.parquet --format json | jq .
+```
+
+```json
+{
+  "a": "/tmp/v1.parquet",
+  "b": "/tmp/v2.parquet",
+  "drift": true,
+  "added":   [{"name": "country", "type": "VARCHAR", "nullable": true}],
+  "dropped": [],
+  "changed": [],
+  "unchanged_count": 2
+}
+```
+
+Easy to pipe into a CI gate:
+
+```yaml
+- run: |
+    pq diff baseline/data.parquet artifacts/data.parquet --format json > /tmp/diff.json
+    if jq -e '.drift' /tmp/diff.json > /dev/null; then
+      echo "::error::schema drift detected"
+      jq '.changed, .dropped' /tmp/diff.json
+      exit 1
+    fi
+```
+
+### 6.3 Type changes vs nullability changes
+
+```bash
+duckdb -c "
+COPY (SELECT 1::BIGINT AS id, 'alice' AS name)
+TO '/tmp/n1.parquet' (FORMAT PARQUET);
+
+COPY (SELECT 1::BIGINT AS id, NULL AS name)
+TO '/tmp/n2.parquet' (FORMAT PARQUET);"
+
+pq diff /tmp/n1.parquet /tmp/n2.parquet
+```
+
+A column that goes from non-null → nullable shows up as `Changed`
+(not `Same`), because adding NULL values to a previously non-null
+column is a breaking change for downstream consumers. Type
+comparison is exact-string on DuckDB's normalised representation,
+so `STRUCT(a INT, b VARCHAR)` and `STRUCT(b VARCHAR, a INT)` are
+considered different.
+
+### 6.4 Row-group pruning ratio in the TUI
+
+```bash
+pq tui /tmp/big.parquet
+# Type: '.user_id, .country where .country == "US"'
+# Press capital E (EXPLAIN ANALYZE)
+```
+
+The Explain panel now shows a per-scan pruning row:
+
+```
+Explain · ANALYZE  22.0 ms
+1 scan(s)  •  833.3k actual rows  •  1 filter(s) pushed  •  2 projections
+  ✓ predicate pushdown: country='US'
+  ✓ projection pushdown: 2 col(s) user_id, country
+  ● actual 833.3k rows  (estimated ~833.3k)
+  ● pruned: 17% (833.3k/5.0M rows)
+```
+
+Color cues: **green** ≥ 50% pruned, **gold** anything > 0%, **dim**
+exactly 0%. If you see 0% with a filter pushed and the file is big,
+pq adds a hint:
+
+```
+💡 filter `country = 'US'` didn't prune any row groups —
+   column may lack min/max stats (common for STRING from
+   older Spark writers)
+```
+
+Common fix: rewrite the parquet with a writer that emits
+column-level min/max statistics (DuckDB's COPY TO does; older
+Spark versions sometimes don't for STRING columns).
+
+### Lesson 6 checkpoint
+
+```bash
+# Schemas identical → exit 0
+pq diff /tmp/v1.parquet /tmp/v1.parquet; echo "exit=$?"
+
+# Schemas drifted → exit 1
+pq diff /tmp/v1.parquet /tmp/v2.parquet; echo "exit=$?"
+
+# Round-trip JSON output through jq
+pq diff /tmp/v1.parquet /tmp/v2.parquet --format json | jq '.added[0].name'
+# "country"
 ```
 
 Done? You've finished the main tutorial. Cheat sheet below for ongoing reference.
