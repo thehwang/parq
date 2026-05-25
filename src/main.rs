@@ -180,6 +180,16 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // v0.12.1: restore the conventional Unix SIGPIPE behaviour. Rust's
+    // runtime sets SIGPIPE to SIG_IGN at startup, which means writing
+    // to a closed pipe surfaces as `Err(EPIPE)` instead of silently
+    // terminating the process. Once we started streaming output (so
+    // `pq -o ndjson f.parquet | head -1` only consumes one row), every
+    // such invocation produced "Error: Broken pipe (os error 32)" on
+    // stderr and exited non-zero. Resetting to SIG_DFL matches the
+    // behaviour of every other Unix CLI tool (cat, grep, sed, jq).
+    reset_sigpipe();
+
     let cli = Cli::parse();
     let conn = open_conn()?;
     register_udfs(&conn, &cli.udfs)?;
@@ -320,6 +330,31 @@ pub(crate) fn open_conn() -> Result<Connection> {
     // because someone has stale env vars sitting around.
     cloud::inject_credentials(&conn);
     Ok(conn)
+}
+
+/// Reset SIGPIPE to its default OS-level disposition (terminate the
+/// process). Rust's runtime sets it to SIG_IGN at startup as a safety
+/// measure, but for a CLI tool that streams output through pipes
+/// (`pq … | head`, `pq … | jq`), the conventional Unix behaviour is
+/// preferred: when the downstream reader closes its end of the pipe,
+/// the kernel sends SIGPIPE and we exit silently. Without this reset
+/// we'd surface every closed-pipe write as a noisy `Err` to the user
+/// even though they got exactly the output they asked for.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: setting a signal handler to SIG_DFL is documented as
+    // safe in POSIX; libc::signal returns the previous handler which
+    // we ignore. No other thread can be running yet (we're in main
+    // before any tokio/std::thread spawns), so no signal-handler race.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {
+    // Windows has no SIGPIPE; broken-pipe writes already surface as
+    // a normal Err which the caller can handle.
 }
 
 /// Wire SIGINT to DuckDB's interrupt API so Ctrl-C cancels the running

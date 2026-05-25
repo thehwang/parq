@@ -587,7 +587,15 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.12** (current) — Big-file mode
+**v0.12.1** (current)
+- [x] `pq … | head -1` no longer prints `Error: Broken pipe (os error 32)`.
+      Rust's runtime ignores SIGPIPE by default, which only matters once we
+      started streaming output in v0.12 — pre-streaming, the producer
+      finished before `head` closed its end of the pipe, so EPIPE never
+      surfaced. We now reset SIGPIPE to `SIG_DFL` in `main()`, matching the
+      conventional Unix behaviour of every other CLI tool.
+
+**v0.12** — Big-file mode
 - [x] Streaming output for ndjson / csv / raw-lines — rows go straight from
       DuckDB's row cursor to stdout without ever filling a `Vec`. Memory
       stays flat regardless of result-set size; `head -1` returns instantly.

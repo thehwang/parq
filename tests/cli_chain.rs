@@ -223,6 +223,46 @@ fn ndjson_streaming_preserves_order() {
     }
 }
 
+/// Regression: `pq | head -1` must not surface a "Broken pipe" error
+/// to stderr just because the downstream consumer closed the pipe
+/// after one row. v0.12.0 forgot to reset SIGPIPE, so streaming
+/// output (introduced in the same release) made every `pq … | head`
+/// invocation print noise. The fix is `signal(SIGPIPE, SIG_DFL)` at
+/// startup.
+#[test]
+#[cfg(unix)]
+fn streaming_to_closed_pipe_emits_no_stderr() {
+    let pq = pq_binary();
+    let sample = sample_parquet();
+    if skip_if_missing(&pq, "pq binary") || skip_if_missing(&sample, "sample.parquet") {
+        return;
+    }
+    // Pipe `pq -o ndjson sample.parquet '.email'` into `head -1`.
+    // The downstream `head` will close stdin after the first line —
+    // pq must take SIGPIPE silently rather than complaining.
+    let mut producer = Command::new(&pq)
+        .args([sample.to_str().unwrap(), "-o", "ndjson"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pq");
+    let pq_stdout = producer.stdout.take().expect("stdout");
+    let head = Command::new("head")
+        .arg("-1")
+        .stdin(pq_stdout)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn head");
+    let _head_out = head.wait_with_output().expect("head finish");
+    let pq_out = producer.wait_with_output().expect("pq finish");
+    let stderr = String::from_utf8_lossy(&pq_out.stderr);
+    assert!(
+        !stderr.to_lowercase().contains("broken pipe")
+            && !stderr.to_lowercase().contains("os error 32"),
+        "pq leaked broken-pipe noise to stderr: {stderr}"
+    );
+}
+
 /// CSV streaming: header + N data rows, emitted in input order.
 #[test]
 fn csv_streaming_writes_header_first() {
