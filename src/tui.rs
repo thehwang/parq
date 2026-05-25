@@ -249,6 +249,22 @@ struct ScanInfo {
     /// matched many parquet files; lets us call out "scanning every
     /// file" suggestions later.
     files_read: Option<u64>,
+    /// v0.14 — physical rows the scan actually read after row-group
+    /// pruning. Pulled from DuckDB's JSON profile (`operator_rows_scanned`
+    /// on the READ_PARQUET node). Only populated by `EXPLAIN ANALYZE`,
+    /// and only when DuckDB version supports the JSON profile shape.
+    rows_scanned: Option<u64>,
+    /// v0.14 — total rows in the parquet file(s) backing this scan, from
+    /// `parquet_file_metadata`. Glob paths sum across matched files.
+    /// Combined with `rows_scanned` to compute `pruning_ratio`.
+    file_total_rows: Option<u64>,
+    /// v0.14 — fraction of rows that DuckDB's row-group pruner skipped:
+    /// `1.0 - rows_scanned / file_total_rows`, clamped to 0.0..=1.0.
+    /// 0.0 means the pruner couldn't skip anything (e.g. predicate isn't
+    /// on a column with min/max stats); 0.8 means 80% of rows never
+    /// touched decompression. None when the JSON profile path didn't
+    /// produce data for this scan.
+    pruning_ratio: Option<f64>,
 }
 
 fn run_preview(
@@ -369,12 +385,144 @@ fn run_explain(conn: &Connection, sql: &str, file: &str, query: &str) -> Option<
     })
 }
 
+/// v0.14 — walk a DuckDB JSON profile (`enable_profiling='json'` shape)
+/// and collect (rows_scanned, filename) for every READ_PARQUET node.
+/// Returns nodes in plan order (depth-first), matching what
+/// `parse_explain` emits from the box-drawing text plan; this lets the
+/// caller merge by index without filename matching.
+fn collect_json_parquet_scans(node: &serde_json::Value) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    walk_json_for_parquet(node, &mut out);
+    out
+}
+
+fn walk_json_for_parquet(node: &serde_json::Value, out: &mut Vec<(u64, String)>) {
+    let is_parquet = node
+        .get("operator_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "READ_PARQUET")
+        .unwrap_or(false);
+    if is_parquet {
+        // Both fields must be present; if either is missing we can't
+        // compute a pruning ratio for this scan and silently skip it.
+        let rows = node.get("operator_rows_scanned").and_then(|v| v.as_u64());
+        let filename = node
+            .get("extra_info")
+            .and_then(|e| e.get("Filename(s)"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let (Some(r), Some(f)) = (rows, filename) {
+            out.push((r, f));
+        }
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for c in children {
+            walk_json_for_parquet(c, out);
+        }
+    }
+}
+
+/// v0.14 — best-effort JSON profile of `EXPLAIN ANALYZE <sql>`.
+///
+/// DuckDB's `enable_profiling='json'` PRAGMA changes the format of
+/// EXPLAIN ANALYZE output: column 1 of the result row becomes a JSON
+/// document instead of the box-drawing text plan. We toggle the PRAGMA,
+/// run analyze, parse the JSON, then ALWAYS reset the PRAGMA so
+/// subsequent preview ticks on this connection get the normal text plan.
+///
+/// Returns None on any failure (older DuckDB without this profile shape,
+/// malformed JSON, etc.) — callers fall back to the text-only path.
+fn try_collect_json_scans(conn: &Connection, sql: &str) -> Option<Vec<(u64, String)>> {
+    let _ = conn.execute("PRAGMA enable_profiling='json'", []);
+    let _ = conn.execute("PRAGMA profiling_mode='detailed'", []);
+    let result: Option<Vec<(u64, String)>> = (|| {
+        let mut stmt = conn.prepare(&format!("EXPLAIN ANALYZE {sql}")).ok()?;
+        let mut rows = stmt.query([]).ok()?;
+        let row = rows.next().ok()??;
+        let json_str: String = row.get(1).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+        Some(collect_json_parquet_scans(&value))
+    })();
+    // Always restore default profiling state so subsequent queries
+    // (preview ticks, suggestions sql, etc.) don't get JSON output
+    // shoved in their first column.
+    let _ = conn.execute("PRAGMA disable_profiling", []);
+    let _ = conn.execute("PRAGMA profiling_mode='standard'", []);
+    result
+}
+
+/// v0.14 — merge JSON-derived pruning data into text-parsed scans.
+/// Matches by **index**: nth READ_PARQUET in the JSON tree maps to the
+/// nth ScanInfo from parse_explain. parse_explain walks the box-drawing
+/// text top-to-bottom and the JSON tree is depth-first child-order, so
+/// for the queries pq supports (single source, simple joins) the orders
+/// align. If the lengths disagree we conservatively skip the merge —
+/// better to show no pruning info than mis-attribute it to the wrong scan.
+fn merge_pruning_metrics(scans: &mut [ScanInfo], json_scans: &[(u64, String)], conn: &Connection) {
+    if scans.len() != json_scans.len() {
+        return;
+    }
+    for (scan, (rows_scanned, filename)) in scans.iter_mut().zip(json_scans.iter()) {
+        // parquet_file_metadata accepts both single paths and globs;
+        // we pass the Filename(s) value through unchanged. On any
+        // failure (cloud paths, missing files, non-parquet) we leave
+        // pruning_ratio as None.
+        let total = file_total_rows(conn, filename);
+        scan.rows_scanned = Some(*rows_scanned);
+        if let Some(t) = total {
+            scan.file_total_rows = Some(t);
+            scan.pruning_ratio = Some(pruning_ratio(*rows_scanned, t));
+        }
+    }
+}
+
+/// Sum row counts across every row group of every parquet file matched
+/// by `path` (a single path or a glob both work). None on error.
+fn file_total_rows(conn: &Connection, path: &str) -> Option<u64> {
+    if path.is_empty() {
+        return None;
+    }
+    // We don't support cloud paths in lite mode for the same reason
+    // count_sql doesn't: parquet_file_metadata over httpfs is unreliable.
+    if path.contains("://") {
+        return None;
+    }
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(sum(num_rows), 0) FROM parquet_file_metadata(?)")
+        .ok()?;
+    let mut rows = stmt.query(duckdb::params![path]).ok()?;
+    let row = rows.next().ok()??;
+    let total: u64 = row.get(0).ok()?;
+    if total == 0 {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+/// Clamp pruning ratio to a sane 0.0..=1.0 range. operator_rows_scanned
+/// occasionally exceeds total_rows by a tiny margin (parallelism /
+/// double-counting in earlier DuckDB versions); without clamping that
+/// would give a negative ratio that renders nonsensically.
+fn pruning_ratio(rows_scanned: u64, file_total: u64) -> f64 {
+    if file_total == 0 {
+        return 0.0;
+    }
+    let raw = 1.0 - (rows_scanned as f64) / (file_total as f64);
+    raw.clamp(0.0, 1.0)
+}
+
 /// Run `EXPLAIN ANALYZE <sql>` on the *full* query (no LIMIT 50 wrapper)
 /// and return a summary populated with actual-runtime numbers.
 ///
 /// Caller must accept that this **executes** the query — fast on small
 /// local files (sub-ms), slow on remote/big ones. Bound to a power-user
 /// keypress (capital `E`) so it never fires by accident.
+///
+/// v0.14: after collecting the text plan we make a *second* best-effort
+/// EXPLAIN ANALYZE pass with `enable_profiling='json'` to pull row-group
+/// pruning metrics. This doubles ANALYZE time on the chosen query but
+/// the user opted in via capital-E so the cost is acceptable.
 fn run_analyze(conn: &Connection, sql: &str, file: &str, query: &str) -> Option<ExplainSummary> {
     let mut text = String::new();
     let mut stmt = match conn.prepare(&format!("EXPLAIN ANALYZE {sql}")) {
@@ -391,7 +539,13 @@ fn run_analyze(conn: &Connection, sql: &str, file: &str, query: &str) -> Option<
             text.push('\n');
         }
     }
-    let (scans, total_seconds) = parse_explain(&text);
+    let (mut scans, total_seconds) = parse_explain(&text);
+    // Best-effort JSON profile path. Failures are silently swallowed —
+    // the panel just shows the same content it always did, minus the
+    // pruning ratio rows.
+    if let Some(json_scans) = try_collect_json_scans(conn, sql) {
+        merge_pruning_metrics(&mut scans, &json_scans, conn);
+    }
     let analyzed = true;
     let suggestions = gen_suggestions(&scans, file, query, analyzed);
     Some(ExplainSummary {
@@ -622,6 +776,26 @@ fn gen_suggestions(scans: &[ScanInfo], file: &str, query: &str, analyzed: bool) 
                     out.push(format!(
                         "💡 scanned {n} files with no pushed predicate — \
                          add a `where` on a partition column to prune"
+                    ));
+                }
+            }
+            // v0.14: pruning ratio is exactly 0 despite the user pushing
+            // a predicate. Almost always means the predicate column has
+            // no min/max stats in the parquet footer (very common for
+            // STRING columns from older Spark writers that don't write
+            // dictionary-page stats). Only fire on files big enough to
+            // matter — small parquets have one row group anyway, no
+            // pruning is possible.
+            const PRUNE_HINT_MIN_ROWS: u64 = 1_000_000;
+            if let (Some(0.0..=0.0), false, Some(total)) =
+                (s.pruning_ratio, s.filters.is_empty(), s.file_total_rows)
+            {
+                if total >= PRUNE_HINT_MIN_ROWS {
+                    let filt = s.filters.join(" AND ");
+                    out.push(format!(
+                        "💡 filter `{filt}` didn't prune any row groups — \
+                         column may lack min/max stats (common for STRING \
+                         from older Spark writers)"
                     ));
                 }
             }
@@ -2442,6 +2616,34 @@ fn render_explain(f: &mut ratatui::Frame, app: &App<'_>, area: Rect) {
                             ]));
                         }
                     }
+                    // v0.14: row-group pruning ratio from JSON profile.
+                    // Color reads as a gauge: green = pruner did real
+                    // work, gold = it pruned something but not much,
+                    // dim = nothing pruned (often a hint that stats
+                    // are missing — gen_suggestions handles that).
+                    if let (Some(ratio), Some(scanned), Some(total)) =
+                        (s.pruning_ratio, s.rows_scanned, s.file_total_rows)
+                    {
+                        let pct = (ratio * 100.0).round() as u64;
+                        let style = if ratio >= 0.5 {
+                            ok
+                        } else if ratio > 0.0 {
+                            warn
+                        } else {
+                            dim
+                        };
+                        out.push(Line::from(vec![
+                            Span::raw(prefix.clone()),
+                            Span::styled(
+                                format!(
+                                    "● pruned: {pct}% ({}/{} rows)",
+                                    fmt_count(scanned),
+                                    fmt_count(total)
+                                ),
+                                style,
+                            ),
+                        ]));
+                    }
                 }
             }
 
@@ -3651,6 +3853,123 @@ TABLE_SCAN
         assert_eq!(total, None);
     }
 
+    // ── v0.14: JSON profile parsing for row-group pruning ──────────────────
+
+    fn json_scan_node(rows_scanned: u64, filename: &str) -> serde_json::Value {
+        serde_json::json!({
+            "operator_name": "READ_PARQUET",
+            "operator_type": "TABLE_SCAN",
+            "operator_rows_scanned": rows_scanned,
+            "extra_info": {
+                "Function": "READ_PARQUET",
+                "Filename(s)": filename,
+                "Total Files Read": "1",
+            },
+            "children": []
+        })
+    }
+
+    #[test]
+    fn collect_json_parquet_scans_single_node() {
+        let profile = serde_json::json!({
+            "latency": 0.01,
+            "children": [json_scan_node(2400, "/tmp/x.parquet")]
+        });
+        let scans = collect_json_parquet_scans(&profile);
+        assert_eq!(scans, vec![(2400, "/tmp/x.parquet".to_string())]);
+    }
+
+    #[test]
+    fn collect_json_parquet_scans_handles_nested_children() {
+        // Real plan tree: BATCH_CREATE_TABLE_AS → PROJECTION → TABLE_SCAN.
+        // We have to walk down to find READ_PARQUET nodes.
+        let profile = serde_json::json!({
+            "operator_name": "BATCH_CREATE_TABLE_AS",
+            "children": [{
+                "operator_name": "PROJECTION",
+                "children": [
+                    json_scan_node(7, "/tmp/a.parquet"),
+                    json_scan_node(11, "/tmp/b.parquet"),
+                ]
+            }]
+        });
+        let scans = collect_json_parquet_scans(&profile);
+        assert_eq!(
+            scans,
+            vec![
+                (7, "/tmp/a.parquet".to_string()),
+                (11, "/tmp/b.parquet".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_json_parquet_scans_skips_missing_fields() {
+        // Node missing operator_rows_scanned → skipped. Node missing
+        // Filename(s) in extra_info → skipped. We don't panic on either.
+        let profile = serde_json::json!({
+            "children": [
+                {
+                    "operator_name": "READ_PARQUET",
+                    "extra_info": {"Filename(s)": "/tmp/no-rows.parquet"},
+                    "children": []
+                },
+                {
+                    "operator_name": "READ_PARQUET",
+                    "operator_rows_scanned": 5,
+                    "extra_info": {},
+                    "children": []
+                },
+                json_scan_node(42, "/tmp/good.parquet")
+            ]
+        });
+        let scans = collect_json_parquet_scans(&profile);
+        assert_eq!(scans, vec![(42, "/tmp/good.parquet".to_string())]);
+    }
+
+    #[test]
+    fn collect_json_parquet_scans_glob_filename_passthrough() {
+        // Critical regression guard: DuckDB returns the LITERAL glob in
+        // Filename(s) for multi-file scans (we verified this against
+        // 1.5.3). We must not split on commas — the glob is one string.
+        let profile = serde_json::json!({
+            "children": [json_scan_node(30, "/tmp/parts/*.parquet")]
+        });
+        let scans = collect_json_parquet_scans(&profile);
+        assert_eq!(scans, vec![(30, "/tmp/parts/*.parquet".to_string())]);
+    }
+
+    #[test]
+    fn collect_json_parquet_scans_ignores_non_parquet_operators() {
+        // Common non-parquet operators in plans we care about.
+        let profile = serde_json::json!({
+            "operator_name": "PROJECTION",
+            "children": [
+                {"operator_name": "FILTER", "children": []},
+                {"operator_name": "EMPTY_RESULT", "children": []},
+                {"operator_name": "BATCH_CREATE_TABLE_AS", "children": []},
+            ]
+        });
+        let scans = collect_json_parquet_scans(&profile);
+        assert!(
+            scans.is_empty(),
+            "non-parquet ops must not be collected: {scans:?}"
+        );
+    }
+
+    #[test]
+    fn pruning_ratio_clamps_to_zero_one_range() {
+        // Normal case: 80% pruned.
+        assert!((pruning_ratio(2_000, 10_000) - 0.8).abs() < 1e-9);
+        // operator_rows_scanned > total (parallelism / double-counting
+        // observed in older DuckDB) clamps to 0 instead of going negative.
+        assert_eq!(pruning_ratio(15_000, 10_000), 0.0);
+        // Zero total (couldn't read metadata) is treated as no info.
+        assert_eq!(pruning_ratio(100, 0), 0.0);
+        // Full prune.
+        assert_eq!(pruning_ratio(0, 10_000), 1.0);
+    }
+
     #[test]
     fn gen_suggestions_hive_partition_unfiltered() {
         let out = gen_suggestions(
@@ -3746,6 +4065,108 @@ TABLE_SCAN
                 .any(|s| s.contains("scanned 50 files with no pushed predicate")),
             "expected many-files hint, got {:?}",
             out
+        );
+    }
+
+    // ── v0.14: row-group-pruning hint ──────────────────────────────────────
+
+    #[test]
+    fn gen_suggestions_zero_prune_with_filter_emits_hint() {
+        // Big file (10M rows) + filter present + pruning_ratio=0
+        // → fire the "stats may be missing" hint.
+        let scan = ScanInfo {
+            filters: vec!["country = 'US'".into()],
+            pruning_ratio: Some(0.0),
+            rows_scanned: Some(10_000_000),
+            file_total_rows: Some(10_000_000),
+            ..Default::default()
+        };
+        let out = gen_suggestions(&[scan], "x.parquet", "where .country == \"US\"", true);
+        assert!(
+            out.iter()
+                .any(|s| s.contains("didn't prune any row groups")),
+            "expected zero-prune hint, got {out:?}"
+        );
+        assert!(
+            out.iter().any(|s| s.contains("country = 'US'")),
+            "hint should name the filter, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn gen_suggestions_zero_prune_without_filter_no_hint() {
+        // No filter pushed → can't blame row-group pruning, no hint.
+        let scan = ScanInfo {
+            filters: vec![],
+            pruning_ratio: Some(0.0),
+            rows_scanned: Some(10_000_000),
+            file_total_rows: Some(10_000_000),
+            ..Default::default()
+        };
+        let out = gen_suggestions(&[scan], "x.parquet", "", true);
+        assert!(
+            out.iter()
+                .all(|s| !s.contains("didn't prune any row groups")),
+            "no-filter case must not emit zero-prune hint, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn gen_suggestions_zero_prune_below_size_threshold_no_hint() {
+        // Tiny file (50k rows) — single row group anyway, pruning isn't
+        // physically possible. Suppress the hint to keep the panel
+        // signal-to-noise high.
+        let scan = ScanInfo {
+            filters: vec!["country = 'US'".into()],
+            pruning_ratio: Some(0.0),
+            rows_scanned: Some(50_000),
+            file_total_rows: Some(50_000),
+            ..Default::default()
+        };
+        let out = gen_suggestions(&[scan], "small.parquet", "where .country == \"US\"", true);
+        assert!(
+            out.iter()
+                .all(|s| !s.contains("didn't prune any row groups")),
+            "small-file case must not emit zero-prune hint, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn gen_suggestions_partial_prune_no_zero_hint() {
+        // Pruner did SOME work (50%) — the hint is specifically for
+        // the "stats are missing" case where pruning is exactly zero.
+        let scan = ScanInfo {
+            filters: vec!["country = 'US'".into()],
+            pruning_ratio: Some(0.5),
+            rows_scanned: Some(5_000_000),
+            file_total_rows: Some(10_000_000),
+            ..Default::default()
+        };
+        let out = gen_suggestions(&[scan], "x.parquet", "where .country == \"US\"", true);
+        assert!(
+            out.iter()
+                .all(|s| !s.contains("didn't prune any row groups")),
+            "partial-prune must not emit zero-prune hint, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn gen_suggestions_zero_prune_only_when_analyzed() {
+        // Plain EXPLAIN can't have pruning_ratio (it's analyze-only); even
+        // if the field were somehow set, we don't emit the hint without
+        // analyze=true since the actual numbers aren't trustworthy.
+        let scan = ScanInfo {
+            filters: vec!["country = 'US'".into()],
+            pruning_ratio: Some(0.0),
+            rows_scanned: Some(10_000_000),
+            file_total_rows: Some(10_000_000),
+            ..Default::default()
+        };
+        let out = gen_suggestions(&[scan], "x.parquet", "where .country == \"US\"", false);
+        assert!(
+            out.iter()
+                .all(|s| !s.contains("didn't prune any row groups")),
+            "plain EXPLAIN must not surface pruning hint, got {out:?}"
         );
     }
 
@@ -4044,6 +4465,9 @@ mod snapshots {
                 estimated_rows: Some(1234),
                 actual_rows: None,
                 files_read: None,
+                rows_scanned: None,
+                file_total_rows: None,
+                pruning_ratio: None,
             }],
             suggestions: vec!["💡 add `where .partition_date >= ...` to prune row groups".into()],
             raw: "PARQUET_SCAN ~1234 rows".into(),
@@ -4066,6 +4490,9 @@ mod snapshots {
                 estimated_rows: Some(1234),
                 actual_rows: Some(1100),
                 files_read: Some(3),
+                rows_scanned: None,
+                file_total_rows: None,
+                pruning_ratio: None,
             }],
             suggestions: vec![],
             raw: "PARQUET_SCAN ~1234 rows / 1100 rows".into(),
@@ -4076,6 +4503,34 @@ mod snapshots {
         app.show_explain = true;
         let s = render_to_string(&mut app, 110, 28);
         snap!("analyze_completed", s);
+    }
+
+    #[test]
+    fn snap_explain_pruning_active() {
+        // v0.14: ANALYZE summary with pruning ratio populated. The new
+        // "● pruned: 80% (...)" row should appear in the per-scan
+        // section and the rest of the panel renders unchanged.
+        let mut preview = make_preview();
+        preview.explain = Some(ExplainSummary {
+            scans: vec![ScanInfo {
+                filters: vec!["country='US'".into()],
+                projections: vec!["country".into(), "revenue".into()],
+                estimated_rows: Some(12_000),
+                actual_rows: Some(2_400),
+                files_read: Some(1),
+                rows_scanned: Some(2_400),
+                file_total_rows: Some(12_000),
+                pruning_ratio: Some(0.8),
+            }],
+            suggestions: vec![],
+            raw: "PARQUET_SCAN ~12000 rows / 2400 rows".into(),
+            analyzed: true,
+            total_seconds: Some(0.022),
+        });
+        let mut app = App::for_test("demo.parquet", make_columns(), preview);
+        app.show_explain = true;
+        let s = render_to_string(&mut app, 110, 28);
+        snap!("explain_pruning_active", s);
     }
 
     #[test]

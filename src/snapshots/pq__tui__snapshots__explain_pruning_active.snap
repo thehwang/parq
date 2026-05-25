@@ -1,0 +1,32 @@
+---
+source: src/tui.rs
+assertion_line: 4533
+---
+┌ Columns · 3 ─────────────┐┌ Query · 12 ms ─────────────────────────────────────────────────────────────────┐
+│▶ ★ id  BIGINT            ││ try: '.email, .country where .country == "US"' or 'group_by .country | count'  │
+│    country  VARCHAR      ││                                                                                │
+│    revenue  DOUBLE       ││                                                                                │
+│                          ││                                                                                │
+│                          │└────────────────────────────────────────────────────────────────────────────────┘
+│                          │┌ Data · 3 rows ─────────────────────────────────────────────────────────────────┐
+│                          ││country  revenue                                                                │
+│                          ││US        100.50                                                                │
+│                          ││DE         85.00                                                                │
+│                          ││JP         63.20                                                                │
+│                          ││                                                                                │
+│                          ││                                                                                │
+│                          ││                                                                                │
+│                          ││                                                                                │
+│                          ││                                                                                │
+│                          ││                                                                                │
+│                          ││                                                                                │
+│                          │└────────────────────────────────────────────────────────────────────────────────┘
+└──────────────────────────┘┌ Explain · ANALYZE  22.0 ms ────────────────────────────────────────────────────┐
+┌ Filters · 0 ─────────────┐│1 scan(s)  •  2.4k actual rows  •  1 filter(s) pushed  •  2 projection(s)       │
+│(none — type `where .col =││  ✓ predicate pushdown: country='US'                                            │
+│                          ││  ✓ projection pushdown: 2 col(s) country, revenue                              │
+│                          ││  ● actual 2.4k rows  (estimated ~12.0k)                                        │
+│                          ││  ● pruned: 80% (2.4k/12.0k rows)                                               │
+│                          ││                                                                                │
+└──────────────────────────┘└────────────────────────────────────────────────────────────────────────────────┘
+ Tab next │ ␣ toggle │ ⏎ append/drill │ ⌫ undo │ Q exit+print │ Esc quit │ : SQL │ e Explain │ E ANALYZE │ ? h
