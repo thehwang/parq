@@ -2,11 +2,10 @@
 
 > `pq` is a Rust single-binary CLI that embeds DuckDB to query Parquet files
 > with a jq-style DSL. This document is the **lookup-style reference
-> manual**: feature-by-feature, non-linear. Comprehensive through v0.11;
-> v0.12 (streaming output, Ctrl-C interrupt, `count --lite`) and v0.13
-> (async TUI preview, stderr spinner, `stats --lite`) are documented in
-> the project [README.md](../README.md) and [tutorial.md §Lesson 5](./tutorial.md#lesson-5-big-file-mode-5-min--v012--v013)
-> until this manual catches up.
+> manual**: feature-by-feature, non-linear, current through v0.13.
+> Big-file specifics (streaming output, Ctrl-C, `count --lite` /
+> `stats --lite`, async TUI preview, stderr spinner) live in
+> [§13](#13-big-file-mode-v012--v013).
 
 > **First time with pq?** Read [`tutorial.md`](./tutorial.md) instead —
 > a 30-minute hands-on walkthrough that takes you from "what is pq" to
@@ -62,6 +61,16 @@
 - [10. Installation](#10-installation)
 - [11. Version history](#11-version-history)
 - [12. Roadmap](#12-roadmap)
+- [**13. Big-file mode (v0.12 + v0.13)**](#13-big-file-mode-v012--v013)
+  - [13.1 Streaming output (v0.12)](#131-streaming-output-v012)
+  - [13.2 CLI Ctrl-C interrupt (v0.12)](#132-cli-ctrl-c-interrupt-v012)
+  - [13.3 SIGPIPE handling (v0.12.1)](#133-sigpipe-handling-v0121)
+  - [13.4 `pq count --lite` (v0.12)](#134-pq-count---lite-v012)
+  - [13.5 `pq stats --lite` (v0.13)](#135-pq-stats---lite-v013)
+  - [13.6 Async TUI preview (v0.13)](#136-async-tui-preview-v013)
+  - [13.7 Stderr progress spinner (v0.13)](#137-stderr-progress-spinner-v013)
+  - [13.8 HTTPFS timeout (v0.13)](#138-httpfs-timeout-v013)
+  - [13.9 Environment-variable summary](#139-environment-variable-summary)
 
 ---
 
@@ -694,13 +703,26 @@ cargo install pq
 | v0.9    | stdin auto-spool (`cat f.parquet \| pq -` Just Works), `-i / --input` formats (parquet / ndjson / csv, sniff by extension), pq becomes a true unix shell primitive |
 | v0.9.1  | `to_ndjson` / `to_jsonl` aliases (unix-friendly names) |
 | v0.10   | nested schema as a first-class citizen: LIST / STRUCT / MAP render as proper JSON (no more Rust Debug), jq-style path sugar (`.tags[0]` / `.tags[]` / `.events[0].kind` / `.metadata["plan"]`), `len` / `keys` / `values` builtins, JSON output preserves SELECT order (`preserve_order`) |
-| **v0.11** | chained UNNEST: `.events[].kind` works in projection / WHERE / GROUP BY / HAVING / ORDER BY. The SQL compiler hoists every `UNNEST(...)` into a derived FROM, the outer query references `_pq_u<i>` aliases; same source dedup (`.events[].kind, .events[].amount` doesn't cartesian-explode); `alias_safe` strips UNNEST wrappers, aggregate alias goes from `sum_UNNEST_events__amount` → `sum_events_amount`; `head -n N` / `head -N` accept the unix flag forms; path errors (bad bracket, unclosed quote) now surface as pq's *invalid path* friendly error instead of DuckDB's *syntax error at or near `]`* |
+| v0.11   | chained UNNEST: `.events[].kind` works in projection / WHERE / GROUP BY / HAVING / ORDER BY. The SQL compiler hoists every `UNNEST(...)` into a derived FROM, the outer query references `_pq_u<i>` aliases; same source dedup (`.events[].kind, .events[].amount` doesn't cartesian-explode); `alias_safe` strips UNNEST wrappers, aggregate alias goes from `sum_UNNEST_events__amount` → `sum_events_amount`; `head -n N` / `head -N` accept the unix flag forms; path errors (bad bracket, unclosed quote) now surface as pq's *invalid path* friendly error instead of DuckDB's *syntax error at or near `]`* |
+| v0.11.1 | terminal-safe table preset (custom single-line UTF-8 box-drawing — replaces `UTF8_FULL_CONDENSED`'s `┆` and heavy `╞═╪╡` glyphs that some macOS fonts render diagonally staggered); TUI panic hook + best-effort `teardown_terminal` so a crashed event loop never leaves your shell in raw mode; `pq --version` finally tracks the git tag |
+| v0.12   | **Big-file mode part 1** — streaming output for `ndjson` / `csv` / raw lines (rows go straight from DuckDB's row cursor to stdout, memory stays flat regardless of result-set size); CLI `Ctrl-C` → `Connection::interrupt_handle().interrupt()` (multi-GB scans unwind in milliseconds); TUI `Ctrl-C` cancels in-flight `EXPLAIN ANALYZE`; `pq count --lite` reads row counts from `parquet_file_metadata(...)` (auto-on for local parquet ≥ 1 GB, override with `PQ_LITE_THRESHOLD`) |
+| v0.12.1 | reset SIGPIPE to `SIG_DFL` in `main()` so `pq -o ndjson f.parquet … \| head -1` no longer surfaces `Error: Broken pipe (os error 32)` from a downstream reader closing the pipe |
+| **v0.13** | **Big-file mode part 2** — TUI preview runs on a worker thread with its own `InterruptHandle` (event loop never freezes; Query header shows `running 1.2s · Esc/Ctrl-C cancels`); `Esc` / `Ctrl-C` interrupt in-flight preview before quitting; CLI stderr spinner (`⠋ 1.2s elapsed — Ctrl-C to cancel`, 300 ms hold-off, TTY-only, `--no-progress` / `PQ_NO_PROGRESS=1` opt-out); `pq stats --lite` aggregates `parquet_metadata(...)` row-group stats per leaf column (sub-second min / max / nulls / row count on a 30 GB file); HTTPFS request timeout drops to 15 s (`PQ_HTTP_TIMEOUT=<ms>` override) so stuck remote reads unblock faster after interrupt |
 
 ---
 
 ## 12. Roadmap
 
-- v0.12 candidates:
+- **v0.14 — Big-file polish**:
+  - Streaming JSON output (today JSON still buffers because of the
+    wrapping `[]`; a hand-written incremental array writer fixes it
+    while keeping the output a valid JSON document);
+  - Explain pane surfaces row-group pruning from DuckDB's JSON profile
+    (`operator_rows_scanned` / `operator_cardinality`) — "filter cut
+    80 % of file before decompression"-style hints;
+  - Schema diff: `pq diff a.parquet b.parquet` — column-level
+    adds / drops / type changes between two parquets, markdown output.
+- **Beyond v0.14**:
   - JOIN + chained UNNEST with finer-grained semantics (currently the
     hoister wraps the whole join in a derived table; could hoist only
     the side that needs unnesting to reduce output rows);
@@ -712,13 +734,297 @@ cargo install pq
     point for engineers who don't like TUIs;
   - Fuzzy query-history search (`Ctrl-R` popup, reuses the completion
     popup renderer);
-  - Excel `.xlsx` direct read (DuckDB excel extension); auto schema diff
-    (compare two parquets, output markdown);
-  - Explain pane: visualise DuckDB zonemap pruning (row-group min/max
-    skipping);
+  - Excel `.xlsx` direct read (DuckDB excel extension);
   - TUI schema completion that recognises LIST / STRUCT / MAP and
-    suggests `[`/`.` after column names, not just plain identifiers.
-- Optional "true streaming" path: switch pq's output format from parquet
-  to Arrow IPC stream so that `pq … | pq -i arrow -` becomes truly
+    suggests `[`/`.` after column names, not just plain identifiers;
+  - "Did you mean .country?" typo suggestions on column-not-found
+    errors;
+  - DuckDB GCS `credential_chain` ADC support once duckdb#22413 lands.
+- Optional "true streaming" path: switch pq's chain output format from
+  ndjson to Arrow IPC stream so that `pq … | pq -i arrow -` becomes
   zero-copy / zero-spool — while keeping ndjson as the canonical
-  chain lingua franca.
+  chain lingua franca for jq / awk interop.
+
+---
+
+## 13. Big-file mode (v0.12 + v0.13)
+
+> When parquet files reach the multi-GB / multi-row-group range, three
+> failure modes show up: pq buffers everything in memory before
+> emitting, slow scans look indistinguishable from a hung process, and
+> there's no way to cancel a query you've changed your mind about.
+> v0.12 and v0.13 fix all three. This section is the lookup-style
+> deep dive — for a hands-on walkthrough start at
+> [`tutorial.md` §Lesson 5](./tutorial.md#lesson-5-big-file-mode-5-min--v012--v013).
+
+### 13.1 Streaming output (v0.12)
+
+Pre-v0.12, `run_and_print` collected every row into a `Vec<Vec<Value>>`
+before emitting any output, regardless of `-o` format. On a 40 GB
+parquet → ndjson roundtrip that meant pq held the entire result set
+in memory and the user saw zero progress until the scan finished.
+
+v0.12 refactored the three line-oriented sinks (`ndjson`, `csv`,
+`raw-lines`) to write directly off DuckDB's row cursor:
+
+| sink         | shape                                | streaming guarantee                                        |
+|--------------|--------------------------------------|------------------------------------------------------------|
+| `-o ndjson`  | one JSON object per line             | row-by-row write to stdout, no `Vec` intermediate          |
+| `-o csv`     | header row, then one record per line | header written first, then row-by-row                      |
+| `-o table`   | aligned ASCII table                  | **buffered** — table needs the column-width pre-pass       |
+| `-o json`    | single JSON array `[{…},{…},…]`      | **buffered** — needs `]` terminator (v0.14: incremental)   |
+| `-o parquet` | binary parquet stream                | DuckDB's `COPY ... TO STDOUT (FORMAT PARQUET)` — streaming |
+
+Practical consequences:
+
+- `pq -o ndjson huge.parquet '.user_id' | head -1` returns within
+  ~ms on a 40 GB file (used to never return until scan completion).
+- Memory usage stays flat regardless of result-set size for the three
+  streaming sinks.
+- Combine with `to_json` / `to_ndjson` / `to_csv` line-output stages
+  for raw-line streaming (`pq … 'to_json' | jq -c '…'`).
+
+### 13.2 CLI Ctrl-C interrupt (v0.12)
+
+`main()` installs a SIGINT handler (via the `ctrlc` crate) that
+forwards the signal to `Connection::interrupt_handle().interrupt()`.
+DuckDB returns `INTERRUPT` from the running scan / aggregate within
+milliseconds — no zombie threads, no half-written output.
+
+```text
+$ pq big.parquet 'group_by .country | sum .revenue'
+^C
+pq: interrupt requested (press Ctrl-C again to force-exit)
+Error: INTERRUPT
+```
+
+Two-strikes escape:
+
+| Press                | Behaviour                                                              |
+|----------------------|------------------------------------------------------------------------|
+| 1st Ctrl-C           | calls `interrupt()`, prints the "interrupt requested" banner to stderr |
+| 2nd Ctrl-C           | `std::process::exit(130)` — bypasses interrupt path entirely           |
+
+The second-press exit is the safety net for cases where `interrupt()`
+itself blocks (e.g. DuckDB's HTTPFS sitting in a slow `recv` against
+a remote parquet). v0.13 also lowered the HTTPFS request timeout
+(see [§13.8](#138-httpfs-timeout-v013)) to make this rare in practice.
+
+### 13.3 SIGPIPE handling (v0.12.1)
+
+The Rust runtime sets SIGPIPE to `SIG_IGN` by default. That's
+appropriate for long-running services but wrong for a Unix CLI:
+when a pipeline reader (e.g. `head -1`) closes its end of stdout,
+the next `write()` returns `EPIPE` and pq surfaces it as
+`Error: Broken pipe (os error 32)` — pure noise.
+
+v0.12.1 resets SIGPIPE to `SIG_DFL` early in `main()`:
+
+```rust
+#[cfg(unix)]
+fn reset_sigpipe() {
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+}
+```
+
+The kernel now terminates pq silently on a closed-pipe write,
+matching the conventional behaviour of every other Unix CLI tool.
+
+### 13.4 `pq count --lite` (v0.12)
+
+```text
+pq count [--lite] [-i INPUT] FILE
+```
+
+When the input is parquet **and** either `--lite` is passed or the
+file trips the auto-lite threshold, the SQL switches from a data
+scan to a metadata-only read of the parquet footer:
+
+```sql
+-- default (scan)
+SELECT count(*) FROM read_parquet('FILE');
+
+-- --lite or auto-lite
+SELECT sum(num_rows)::BIGINT AS rows FROM parquet_file_metadata('FILE');
+```
+
+Auto-lite rules:
+
+| condition                                                 | auto-lite |
+|-----------------------------------------------------------|-----------|
+| local file ≥ 1 GB (configurable via `PQ_LITE_THRESHOLD`)  | **yes**, prints a one-line stderr notice |
+| glob whose first 64 entries sum to ≥ threshold            | **yes**   |
+| cloud path (`gs://`, `s3://`, `https://`)                 | **no** — size detection over the network is a footgun; pass `--lite` explicitly |
+| non-parquet input (ndjson / csv)                          | **no** — there's no metadata footer to read; lite degrades to `count(*)` |
+
+Override the threshold (in raw bytes, no suffix parsing — keep it
+simple): `PQ_LITE_THRESHOLD=104857600 pq count file.parquet` treats
+anything ≥ 100 MB as "big".
+
+### 13.5 `pq stats --lite` (v0.13)
+
+```text
+pq stats [--lite] [-i INPUT] FILE
+```
+
+Default `pq stats` runs `SUMMARIZE` over the data — exact, but reads
+every byte. Lite mode aggregates `parquet_metadata(...)` row-group
+stats per leaf column path:
+
+```sql
+-- default (full scan)
+SELECT column_name, column_type, min, max, approx_unique AS approx_distinct,
+       null_percentage AS null_pct
+FROM (SUMMARIZE SELECT * FROM read_parquet('FILE'));
+
+-- --lite (metadata only)
+SELECT path_in_schema AS column_name,
+       any_value(type) AS column_type,
+       min(stats_min_value)::VARCHAR AS min,
+       max(stats_max_value)::VARCHAR AS max,
+       sum(num_values)::BIGINT       AS rows,
+       sum(stats_null_count)::BIGINT AS nulls
+FROM parquet_metadata('FILE')
+GROUP BY path_in_schema
+ORDER BY min(row_group_id), min(column_id);
+```
+
+| column            | full scan | lite | notes                                                       |
+|-------------------|-----------|------|-------------------------------------------------------------|
+| `column_name`     | ✓         | ✓    | leaf path; nested STRUCT / LIST fields show as dotted paths |
+| `column_type`     | ✓ (logical, e.g. `BIGINT`) | ✓ (physical, e.g. `INT64`) | reflects DuckDB vs parquet type system  |
+| `min` / `max`     | ✓         | ✓    | from row-group stats; some writers skip stats for STRINGs   |
+| `approx_distinct` | ✓         | ✗    | needs the data — HyperLogLog over actual values             |
+| `null_pct`        | ✓         | ✗    | needs the data — DuckDB computes it from the scan           |
+| `rows`            | implicit  | ✓    | `sum(num_values)` per column                                |
+| `nulls`           | implicit  | ✓    | `sum(stats_null_count)` per column                          |
+
+Auto-lite rules and `PQ_LITE_THRESHOLD` semantics are identical to
+[§13.4](#134-pq-count---lite-v012). Schema order is preserved via
+`ORDER BY min(row_group_id), min(column_id)` — `file_offset` was
+the first attempt and turned out to be NULL on some writers, which
+collapsed the output to alphabetic. Don't regress that.
+
+Caveats worth knowing:
+- `min` / `max` come from the writer's row-group stats. Most
+  writers populate them, but a few (older Spark, non-default
+  Pandas) skip them for STRING columns; lite reports NULL there.
+- One row per leaf field path. STRUCT / LIST nested fields show up
+  with dotted names — useful for skinny schemas, but rows don't
+  line up 1:1 with the top-level schema.
+
+### 13.6 Async TUI preview (v0.13)
+
+Pre-v0.13, the TUI ran `run_preview(...)` synchronously inside the
+event loop's tick handler. Every keystroke against a 12 GB file
+froze the entire UI until DuckDB returned — not even Ctrl-C got
+processed because the event loop wasn't running.
+
+v0.13 introduces `PreviewJob` (mirrors `AnalyzeJob` from v0.7):
+
+```rust
+struct PreviewJob {
+    rx: mpsc::Receiver<Preview>,
+    started_at: Instant,
+    interrupt: Arc<duckdb::InterruptHandle>,
+    query_when_started: String,
+}
+```
+
+Lifecycle:
+
+1. **Throttle fires** (200 ms after the last edit) → `start_preview`
+   opens a fresh DuckDB connection on the main thread, grabs its
+   `interrupt_handle()`, then moves the connection into a worker
+   thread. The worker calls `run_preview(...)` and sends the result
+   over an mpsc channel.
+2. **Each tick** → `poll_preview` does one non-blocking `try_recv`.
+   When a result lands, `App::preview` is overwritten and the
+   post-result housekeeping runs (cursor clamp, history record,
+   `selected` re-derivation).
+3. **User types more** → `schedule_compile` calls `cancel_preview`,
+   which fires `interrupt.interrupt()` and drops the `PreviewJob`.
+   The worker's connection observes the interrupt at the next
+   chunk boundary and exits; the result (if any) goes to a closed
+   channel and is silently discarded.
+4. **Esc / Ctrl-C** → priority is preview → analyze → quit. First
+   press cancels the running job and emits a flash; second press
+   (with no job running) quits the TUI.
+
+Query header reflects state:
+
+```text
+┌─ Query · running 1.2s · Esc/Ctrl-C cancels ─┐
+│ group_by .country | sum .revenue            │
+└──────────────────────────────────────────────┘
+```
+
+Title format: `Query · running 1.2s` while the worker is in flight,
+`Query · 84 ms` once a result lands, `Query · ⚠ <message>` on error.
+
+The HTTPFS timeout in [§13.8](#138-httpfs-timeout-v013) bounds the
+worst-case interrupt latency on remote files.
+
+### 13.7 Stderr progress spinner (v0.13)
+
+A tiny RAII handle (`progress::Spinner`) wraps long CLI queries.
+The spinner thread polls a stop flag every 80 ms and writes one
+carriage-returned line to stderr:
+
+```text
+⠋  4.2s elapsed — Ctrl-C to cancel
+```
+
+Gating (all three must be false to draw — first true wins):
+
+| condition                          | spinner suppressed because |
+|------------------------------------|----------------------------|
+| `--no-progress` (CLI flag)         | user opt-out               |
+| `PQ_NO_PROGRESS=1` (env var)       | script opt-out             |
+| `stderr` is not a TTY              | piped / redirected / CI    |
+
+Additional behaviour:
+
+- 300 ms hold-off before the first frame so short queries (the
+  common case) never flash a spinner.
+- Frame cadence: 80 ms per tick (12.5 fps) — visibly animated
+  without burning CPU.
+- On `Drop`, signals the worker, joins it, and writes `\r\x1b[2K`
+  to clear whatever was on the line.
+- Frames: `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏` (Braille spinner — same set
+  used by `pip`, `cargo`, et al.).
+
+### 13.8 HTTPFS timeout (v0.13)
+
+`open_conn()` now sets two HTTPFS pragmas at startup:
+
+```sql
+SET http_keep_alive = true;     -- pool TCP across row-group requests
+SET http_timeout = 15000;       -- ms, override with PQ_HTTP_TIMEOUT
+```
+
+The default `http_timeout` shipped by DuckDB is 30 s. Lowering it to
+15 s halves the worst-case interrupt latency on stuck `gs://` /
+`s3://` reads — a `Ctrl-C` against a hung remote scan unblocks
+within 15 s instead of 30 s. Raise it via `PQ_HTTP_TIMEOUT=<ms>` for
+notoriously slow / flaky links.
+
+### 13.9 Environment-variable summary
+
+Big-file mode adds three env vars to the existing set; collected
+here so `env | grep PQ_` is enough to reconstruct a session:
+
+| var                  | default | effect                                                     |
+|----------------------|---------|------------------------------------------------------------|
+| `PQ_LITE_THRESHOLD`  | `1073741824` (1 GB) | bytes; auto-lite (count / stats) for local parquet at or above this size |
+| `PQ_NO_PROGRESS`     | unset   | when set to anything, suppress the stderr spinner — equivalent to `--no-progress` |
+| `PQ_HTTP_TIMEOUT`    | `15000` (15 s)      | HTTPFS request timeout in milliseconds                     |
+| `PQ_DEBUG`           | unset   | (existing) verbose logging for SIGINT installation, cred injection, etc. |
+| `PQ_GCS_BEARER_TOKEN`, `PQ_GCS_HMAC_*` | unset | (existing) GCS credentials — see [§6](#6-cloud-credentials-auto-injection) |
+
+CLI knobs that pair with the above:
+
+| flag                                  | scope                          | notes                                              |
+|---------------------------------------|--------------------------------|----------------------------------------------------|
+| `--lite`                              | `pq count`, `pq stats`         | force metadata-only path regardless of size        |
+| `--no-progress`                       | global (works on all subcommands) | identical to `PQ_NO_PROGRESS=1`                    |
