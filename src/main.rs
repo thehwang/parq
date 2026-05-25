@@ -60,14 +60,14 @@ struct Cli {
     query: Option<String>,
 
     /// Output: auto | table | json | ndjson | csv | parquet
-    #[arg(short, long, default_value = "auto")]
+    #[arg(short, long, default_value = "auto", global = true)]
     output: String,
 
     /// Input format: auto | parquet | ndjson (jsonl/json) | csv (tsv).
     /// `auto` sniffs from file extension (.ndjson/.csv → matching reader,
     /// otherwise parquet). For stdin (`-`) auto means parquet — pass an
     /// explicit `-i ndjson` to chain `pq f.parquet '...' | pq -i ndjson '...'`.
-    #[arg(short = 'i', long, default_value = "auto")]
+    #[arg(short = 'i', long, default_value = "auto", global = true)]
     input: String,
 
     /// Row limit for default head; default 20. Use 0 for no limit.
@@ -76,7 +76,7 @@ struct Cli {
     n: usize,
 
     /// Show the SQL pq would run, but don't execute (for debugging the parser)
-    #[arg(long)]
+    #[arg(long, global = true)]
     explain: bool,
 
     /// Watch mode: re-run the query every N seconds (clearing the screen between

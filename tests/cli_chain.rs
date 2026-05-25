@@ -371,8 +371,7 @@ fn json_streaming_writes_brackets_and_separators() {
     );
 
     // Parse as JSON to ensure validity and check structure
-    let parsed: serde_json::Result<Vec<serde_json::Value>> =
-        serde_json::from_str(trimmed);
+    let parsed: serde_json::Result<Vec<serde_json::Value>> = serde_json::from_str(trimmed);
     assert!(
         parsed.is_ok(),
         "JSON output must be a valid JSON array, got parse error: {}",
@@ -380,10 +379,7 @@ fn json_streaming_writes_brackets_and_separators() {
     );
 
     let arr = parsed.unwrap();
-    assert!(
-        !arr.is_empty(),
-        "JSON array must contain at least one row"
-    );
+    assert!(!arr.is_empty(), "JSON array must contain at least one row");
 
     // Verify each row is a JSON object
     for (i, row) in arr.iter().enumerate() {
