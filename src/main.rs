@@ -31,6 +31,7 @@ mod cloud;
 mod lineage;
 mod output;
 mod parser;
+mod progress;
 mod source;
 mod tui;
 
@@ -89,6 +90,15 @@ struct Cli {
     #[arg(long = "udf", value_name = "MACRO")]
     udfs: Vec<String>,
 
+    /// Suppress the stderr progress spinner / elapsed timer that
+    /// shows up on long-running queries. v0.13 — by default pq
+    /// draws a `⠋ 1.2s elapsed — Ctrl-C to cancel` line on stderr
+    /// when stderr is a TTY and the query has been running for
+    /// more than 300 ms; this flag (and `PQ_NO_PROGRESS=1`) turn
+    /// it off for scripts that capture stderr.
+    #[arg(long = "no-progress", global = true)]
+    no_progress: bool,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -121,6 +131,20 @@ enum Cmd {
         file: String,
         #[arg(short = 'i', long, default_value = "auto")]
         input: String,
+        /// Force the metadata-only path (parquet_metadata).
+        ///
+        /// On parquet inputs this reads per-row-group min/max/null
+        /// stats from each file's footer and aggregates them — no
+        /// scan, no decompress. Default `pq stats` runs `SUMMARIZE`,
+        /// which is exact but reads every byte; on a multi-GB file
+        /// the lite path is the difference between sub-second and
+        /// minutes. Lite output omits `approx_distinct` and
+        /// `null_pct` (those need the data); ships row counts and
+        /// min/max only. Auto-on for local parquet >= 1 GB; this
+        /// flag forces it elsewhere (e.g. cloud paths). Override the
+        /// auto threshold with PQ_LITE_THRESHOLD.
+        #[arg(long = "lite")]
+        lite: bool,
     },
     /// Random sample of N rows.
     Sample {
@@ -270,6 +294,10 @@ fn run_query(cli: &Cli, conn: &Connection, fmt: OutputFormat) -> Result<()> {
     } else {
         fmt
     };
+    // v0.13: stderr spinner for long-running queries. RAII drop
+    // clears the line as soon as run_and_print returns. No-op when
+    // stderr isn't a TTY, --no-progress is set, or PQ_NO_PROGRESS=1.
+    let _spinner = progress::Spinner::maybe_start(cli.no_progress);
     output::run_and_print(conn, &plan.sql, effective_fmt)
 }
 
@@ -325,6 +353,22 @@ pub(crate) fn open_conn() -> Result<Connection> {
         LOAD httpfs;
         ",
     );
+    // v0.13: shrink the HTTPFS request timeout so a stuck remote
+    // request unblocks within 15 s of an interrupt. Default is 30 s
+    // which feels indistinguishable from "TUI hung" when a user
+    // presses Ctrl-C against a slow gs:// / s3:// scan. Setting is
+    // best-effort — if the duckdb build is too old to know the
+    // pragma we keep the default. http_keep_alive=true (the default)
+    // is set explicitly so we don't tear down TCP between row-group
+    // requests on the same parquet file. Override with PQ_HTTP_TIMEOUT
+    // in milliseconds (e.g. PQ_HTTP_TIMEOUT=60000 for very flaky links).
+    let timeout_ms = std::env::var("PQ_HTTP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15000);
+    let _ = conn.execute_batch(&format!(
+        "SET http_keep_alive=true; SET http_timeout={timeout_ms};"
+    ));
     // Auto-inject any cloud creds visible in the env (PQ_GCS_HMAC_*, AWS_*).
     // Failures are silent unless PQ_DEBUG=1 — we never block local-file usage
     // because someone has stale env vars sitting around.
@@ -391,7 +435,7 @@ fn install_sigint_handler(conn: &Connection) {
     }
 }
 
-fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -> Result<()> {
+fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) -> Result<()> {
     // The TUI takes over the terminal — handle it before we build any SQL.
     if let Cmd::Tui {
         file,
@@ -413,7 +457,13 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
         // 50 (TUI's historical preview height); we floor at 1 to avoid an
         // empty viewport.
         let preview_limit = (*n).max(1);
-        return tui::run(tui_conn, file.clone(), input_fmt, preview_limit, udfs.clone());
+        return tui::run(
+            tui_conn,
+            file.clone(),
+            input_fmt,
+            preview_limit,
+            udfs.clone(),
+        );
     }
 
     // v0.9: subcommands also get stdin-spool + format dispatch. Each
@@ -422,7 +472,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
     // can't be combined with a subcommand under our clap config anyway).
     let (raw_file, input_str) = match cmd {
         Cmd::Schema { file, input }
-        | Cmd::Stats { file, input }
+        | Cmd::Stats { file, input, .. }
         | Cmd::Sample { file, input, .. }
         | Cmd::Head { file, input, .. }
         | Cmd::Tail { file, input, .. }
@@ -438,12 +488,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
             "SELECT column_name, column_type, \"null\" AS nullable \
              FROM (DESCRIBE SELECT * FROM {src})"
         ),
-        Cmd::Stats { .. } => format!(
-            "SELECT column_name, column_type, min, max, \
-                    approx_unique AS approx_distinct, \
-                    null_percentage AS null_pct \
-             FROM (SUMMARIZE SELECT * FROM {src})"
-        ),
+        Cmd::Stats { lite, .. } => stats_sql(&spool.resolved, input_fmt, *lite, &src),
         Cmd::Sample { n, .. } => {
             format!("SELECT * FROM {src} USING SAMPLE {n} ROWS")
         }
@@ -457,6 +502,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
     };
 
+    let _spinner = progress::Spinner::maybe_start(cli.no_progress);
     output::run_and_print(conn, &sql, fmt)
 }
 
@@ -471,12 +517,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, _cli: &Cli) -
 /// decompress — just the file's own self-reported row count. On a
 /// 40 GB local file this is the difference between seconds and a
 /// fraction of a second; on globs it's per-file row counts summed.
-fn count_sql(
-    resolved_path: &str,
-    input_fmt: InputFormat,
-    forced: bool,
-    src: &str,
-) -> String {
+fn count_sql(resolved_path: &str, input_fmt: InputFormat, forced: bool, src: &str) -> String {
     let auto = should_auto_lite(resolved_path);
     if input_fmt == InputFormat::Parquet && (forced || auto) {
         let escaped = resolved_path.replace('\'', "''");
@@ -489,11 +530,63 @@ fn count_sql(
                 fmt_bytes(lite_threshold())
             );
         }
-        format!(
-            "SELECT sum(num_rows)::BIGINT AS rows FROM parquet_file_metadata('{escaped}')"
-        )
+        format!("SELECT sum(num_rows)::BIGINT AS rows FROM parquet_file_metadata('{escaped}')")
     } else {
         format!("SELECT count(*) AS rows FROM {src}")
+    }
+}
+
+/// Build the SQL for `pq stats`.
+///
+/// Default path runs DuckDB's `SUMMARIZE` over the data. v0.13 adds a
+/// metadata-only path that aggregates `parquet_metadata(...)` per
+/// row group: per column → `min(stats_min_value)`,
+/// `max(stats_max_value)`, `sum(stats_null_count)`, total rows. No
+/// scan, no decompress — works in sub-second on a 30 GB file.
+///
+/// Caveats of lite mode (documented in the README):
+///   * No `approx_distinct` / `null_pct` — those need the data.
+///   * `min` / `max` come from the writer's row-group stats. Most
+///     parquet writers populate them, but a few (older Spark,
+///     non-default Pandas) skip them for STRING columns; lite then
+///     reports NULL for those bounds.
+///   * One row per leaf field path. Nested STRUCT / LIST fields show
+///     up by their dotted path, same as DuckDB's `parquet_metadata`
+///     output. That's a feature for skinny parquet schemas (you see
+///     stats for nested array elements) but it does mean rows don't
+///     line up 1:1 with the top-level schema.
+fn stats_sql(resolved_path: &str, input_fmt: InputFormat, forced: bool, src: &str) -> String {
+    let auto = should_auto_lite(resolved_path);
+    if input_fmt == InputFormat::Parquet && (forced || auto) {
+        let escaped = resolved_path.replace('\'', "''");
+        if auto && !forced {
+            eprintln!(
+                "pq: lite mode (file >= {}; reading column stats from parquet footer)",
+                fmt_bytes(lite_threshold())
+            );
+        }
+        // any_value(type) is fine here — Parquet schema metadata is
+        // consistent across row groups for the same column path.
+        // num_values + stats_null_count gives us a total non-null
+        // count without scanning.
+        format!(
+            "SELECT path_in_schema AS column_name, \
+                    any_value(type) AS column_type, \
+                    min(stats_min_value)::VARCHAR AS min, \
+                    max(stats_max_value)::VARCHAR AS max, \
+                    sum(num_values)::BIGINT AS rows, \
+                    sum(stats_null_count)::BIGINT AS nulls \
+             FROM parquet_metadata('{escaped}') \
+             GROUP BY path_in_schema \
+             ORDER BY min(row_group_id), min(column_id)"
+        )
+    } else {
+        format!(
+            "SELECT column_name, column_type, min, max, \
+                    approx_unique AS approx_distinct, \
+                    null_percentage AS null_pct \
+             FROM (SUMMARIZE SELECT * FROM {src})"
+        )
     }
 }
 
@@ -694,6 +787,78 @@ mod tests {
         assert!(
             sql.contains("count(*)"),
             "default count path should be count(*); got: {sql}"
+        );
+    }
+
+    #[test]
+    fn stats_sql_lite_uses_parquet_metadata_for_parquet() {
+        // Forced lite + parquet → metadata SQL aggregating row-group
+        // stats, no scan. Banner is suppressed because the user opted
+        // in; we only print it on auto-trigger.
+        let sql = stats_sql(
+            "/tmp/x.parquet",
+            InputFormat::Parquet,
+            true,
+            "read_parquet('/tmp/x.parquet')",
+        );
+        assert!(
+            sql.contains("parquet_metadata"),
+            "lite forced should pick metadata path; got: {sql}"
+        );
+        assert!(
+            !sql.contains("SUMMARIZE"),
+            "lite forced should NOT use SUMMARIZE; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn stats_sql_lite_orders_columns_by_schema_position() {
+        // Schema order is preserved via min(row_group_id) +
+        // min(column_id), not alphabetic. This was a real bug
+        // during v0.13 dev — `file_offset` is not always populated,
+        // so the first ordering attempt fell through to alphabetic
+        // and a 50-column schema came out scrambled.
+        let sql = stats_sql(
+            "/tmp/x.parquet",
+            InputFormat::Parquet,
+            true,
+            "read_parquet('/tmp/x.parquet')",
+        );
+        assert!(
+            sql.contains("ORDER BY min(row_group_id), min(column_id)"),
+            "lite SQL should preserve schema order; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn stats_sql_falls_back_to_summarize_for_ndjson() {
+        // Non-parquet inputs ignore --lite and run SUMMARIZE — there's
+        // no metadata footer to read.
+        let sql = stats_sql(
+            "/tmp/x.ndjson",
+            InputFormat::Ndjson,
+            true,
+            "read_json('/tmp/x.ndjson', format='newline_delimited')",
+        );
+        assert!(
+            sql.contains("SUMMARIZE"),
+            "non-parquet lite should fall back to SUMMARIZE; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn stats_sql_default_path_uses_summarize() {
+        // No --lite, no auto-trigger → original SUMMARIZE path so
+        // existing CLI behaviour is preserved bit-for-bit.
+        let sql = stats_sql(
+            "/nonexistent.parquet",
+            InputFormat::Parquet,
+            false,
+            "read_parquet('/nonexistent.parquet')",
+        );
+        assert!(
+            sql.contains("SUMMARIZE"),
+            "default stats path should be SUMMARIZE; got: {sql}"
         );
     }
 }

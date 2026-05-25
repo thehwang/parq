@@ -2308,9 +2308,7 @@ mod tests {
         );
         // `len(.events)` and `values(.metadata)` exercise the same arm.
         assert!(cmp("f.parquet", "len(.events)", 0).contains("SELECT len(events)"));
-        assert!(
-            cmp("f.parquet", "values(.metadata)", 0).contains("SELECT map_values(metadata)")
-        );
+        assert!(cmp("f.parquet", "values(.metadata)", 0).contains("SELECT map_values(metadata)"));
     }
 
     #[test]

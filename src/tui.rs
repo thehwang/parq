@@ -211,6 +211,24 @@ struct AnalyzeJob {
     interrupt: std::sync::Arc<duckdb::InterruptHandle>,
 }
 
+/// v0.13: in-flight preview worker. Mirrors AnalyzeJob — same
+/// pattern, separate connection, separate interrupt handle. Pre-v0.13
+/// the preview ran synchronously inside `maybe_run_compile`, which
+/// meant that typing a query against a 12 GB file would freeze the
+/// entire TUI for the duration of the scan; not even Ctrl-C got
+/// processed because the event loop wasn't running.
+struct PreviewJob {
+    rx: mpsc::Receiver<Preview>,
+    started_at: Instant,
+    interrupt: std::sync::Arc<duckdb::InterruptHandle>,
+    /// Snapshot of the query text the worker is running. We use this
+    /// to decide whether the result is still relevant when it lands
+    /// (the user may have typed more by then) — primarily useful for
+    /// the history-recording side-effect, which should only fire when
+    /// the result we got back actually matches the current query.
+    query_when_started: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ScanInfo {
     /// Filters that DuckDB pushed down into the scan — visible in EXPLAIN
@@ -674,6 +692,13 @@ struct App<'ta> {
     /// stays responsive — even on remote/large parquet files where
     /// ANALYZE can take seconds.
     analyze_job: Option<AnalyzeJob>,
+    /// v0.13: in-flight preview worker. Set whenever the throttle
+    /// fires and we kick off a fresh `run_preview` on a worker
+    /// thread; cleared when the result lands (or the user types
+    /// more, which interrupts and overwrites). Decouples the event
+    /// loop from query latency so the TUI never freezes on a slow
+    /// scan.
+    preview_job: Option<PreviewJob>,
     /// True when `?` is pressed → renders a centred help overlay over the
     /// 4-panel layout. Any subsequent key dismisses it (so `?` then start
     /// typing in Query feels natural).
@@ -794,6 +819,7 @@ impl<'ta> App<'ta> {
             show_sql: false,
             show_explain: false,
             analyze_job: None,
+            preview_job: None,
             show_help: false,
             last_compiled: String::new(),
             pending_compile_at: None,
@@ -838,6 +864,7 @@ impl<'ta> App<'ta> {
             show_sql: false,
             show_explain: false,
             analyze_job: None,
+            preview_job: None,
             show_help: false,
             last_compiled: String::new(),
             pending_compile_at: None,
@@ -1045,65 +1072,149 @@ impl<'ta> App<'ta> {
 
     fn schedule_compile(&mut self) {
         self.pending_compile_at = Some(Instant::now() + SQL_THROTTLE);
-        // Any in-flight ANALYZE was scoped to the OLD query — its
-        // numbers won't match what's about to render. Drop the
-        // receiver; the worker thread keeps running but its result
-        // gets orphaned. User can press `E` again on the new query.
-        self.analyze_job = None;
+        // Any in-flight ANALYZE / preview was scoped to the OLD
+        // query — interrupt them so the worker threads don't keep
+        // grinding through a multi-GB scan we no longer care about.
+        // The preview cancel is what makes typing feel snappy on big
+        // remote files: pre-v0.13 every keystroke would queue up a
+        // synchronous run_preview that the user couldn't cancel.
+        self.cancel_analyze();
+        self.cancel_preview();
     }
 
-    fn maybe_run_compile(&mut self, conn: &Connection) {
-        if let Some(deadline) = self.pending_compile_at {
-            if Instant::now() >= deadline {
-                let q = self.current_query_text();
-                if q != self.last_compiled {
-                    self.preview = run_preview(
-                        conn,
-                        &self.file,
-                        &q,
-                        self.input_fmt,
-                        self.preview_limit,
-                    );
-                    self.last_compiled = q.clone();
-                    // Record successful (non-empty, non-error) queries
-                    // in history. We don't gate on preview.error — even
-                    // a query that errored is something the user might
-                    // want to recall and fix later.
-                    if !q.trim().is_empty() {
-                        self.record_history(q.clone());
-                    }
-                    // After the data refreshes, both the column- and row-
-                    // cursor may now point past the end of the new
-                    // headers/rows (e.g. user changed projection from 3
-                    // cols to 1, or filter wiped the result set). Clamp
-                    // both, dropping to None when the panel is empty so
-                    // we don't render a phantom highlight.
-                    if let Some(i) = self.data_col_idx {
-                        if i >= self.preview.headers.len() {
-                            self.data_col_idx = if self.preview.headers.is_empty() {
-                                None
-                            } else {
-                                Some(self.preview.headers.len() - 1)
-                            };
-                        }
-                    }
-                    if let Some(i) = self.data_row_idx {
-                        if i >= self.preview.rows.len() {
-                            self.data_row_idx = if self.preview.rows.is_empty() {
-                                None
-                            } else {
-                                Some(self.preview.rows.len() - 1)
-                            };
-                        }
+    /// Tick handler: when the throttle deadline fires, kick off a
+    /// new preview on a worker thread. v0.13 — pre-v0.13 this ran
+    /// `run_preview` synchronously inside the event loop, blocking
+    /// the entire TUI for the duration of the scan.
+    fn maybe_run_compile(&mut self) {
+        let Some(deadline) = self.pending_compile_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.pending_compile_at = None;
+        let q = self.current_query_text();
+        // Don't burn a worker thread re-running the same query the
+        // user already saw results for.
+        if q == self.last_compiled && self.preview_job.is_none() {
+            return;
+        }
+        self.start_preview(q);
+    }
+
+    /// Start a preview worker for the given query string. Cancels
+    /// any preview already in flight (the result we'd get back is
+    /// stale relative to what the user just typed).
+    fn start_preview(&mut self, query: String) {
+        self.cancel_preview();
+        // Open the worker's connection on the main thread so we can
+        // grab its interrupt handle BEFORE moving the connection
+        // into the closure. Connection is `Send` (duckdb-rs marks
+        // it so) — the move is safe.
+        let Ok(conn) = crate::open_conn() else {
+            return;
+        };
+        let udfs = self.udfs.clone();
+        if crate::register_udfs(&conn, &udfs).is_err() {
+            // Macro registration failure is rare; fall back to the
+            // panel's existing error state (last preview stays).
+            return;
+        }
+        let interrupt = conn.interrupt_handle();
+        let (tx, rx) = mpsc::channel();
+        let file = self.file.clone();
+        let fmt = self.input_fmt;
+        let limit = self.preview_limit;
+        let q_for_worker = query.clone();
+        thread::spawn(move || {
+            let preview = run_preview(&conn, &file, &q_for_worker, fmt, limit);
+            // Drops the receiver if the user moved on (cancel_preview /
+            // schedule_compile dropped this PreviewJob); silently OK.
+            let _ = tx.send(preview);
+        });
+        self.preview_job = Some(PreviewJob {
+            rx,
+            started_at: Instant::now(),
+            interrupt,
+            query_when_started: query,
+        });
+    }
+
+    /// Drop the preview job and tell its DuckDB connection to
+    /// interrupt mid-scan. The worker thread will return shortly,
+    /// silently discarding its result; we don't wait on it.
+    ///
+    /// On remote files (`gs://` / `s3://`) DuckDB's HTTPFS only
+    /// checks the interrupt flag at chunk boundaries, so a second
+    /// Esc / Ctrl-C with no job in flight falls through to quit and
+    /// the OS reaps the orphan worker thread on process exit.
+    fn cancel_preview(&mut self) -> bool {
+        if let Some(job) = self.preview_job.take() {
+            let secs = job.started_at.elapsed().as_secs_f32();
+            job.interrupt.interrupt();
+            self.flash_msg(format!(
+                "✋ interrupt sent ({:.1}s) — press again to exit",
+                secs
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Non-blocking check for a finished preview. When one lands,
+    /// promote it to `self.preview` and run the post-result house-
+    /// keeping (history record, cursor clamp, derive selected from
+    /// query text). Called once per event-loop tick.
+    fn poll_preview(&mut self) {
+        let Some(job) = &self.preview_job else { return };
+        match job.rx.try_recv() {
+            Ok(preview) => {
+                let q = job.query_when_started.clone();
+                self.preview_job = None;
+                self.preview = preview;
+                self.last_compiled = q.clone();
+                if !q.trim().is_empty() {
+                    self.record_history(q);
+                }
+                // Cursor clamp: a smaller projection / wiped filter
+                // can leave data_col_idx / data_row_idx pointing past
+                // the end of the new result set.
+                if let Some(i) = self.data_col_idx {
+                    if i >= self.preview.headers.len() {
+                        self.data_col_idx = if self.preview.headers.is_empty() {
+                            None
+                        } else {
+                            Some(self.preview.headers.len() - 1)
+                        };
                     }
                 }
-                self.pending_compile_at = None;
-                // Re-derive column.selected from query text (string-match).
+                if let Some(i) = self.data_row_idx {
+                    if i >= self.preview.rows.len() {
+                        self.data_row_idx = if self.preview.rows.is_empty() {
+                            None
+                        } else {
+                            Some(self.preview.rows.len() - 1)
+                        };
+                    }
+                }
+                // Re-derive column.selected from the just-compiled
+                // query text (string-match) so the Columns panel
+                // stays in sync with the projection.
                 let q_lower = self.last_compiled.to_ascii_lowercase();
                 for c in &mut self.columns {
                     let needle = format!(".{}", c.name.to_ascii_lowercase());
                     c.selected = q_lower.contains(&needle);
                 }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Still running.
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Worker died without sending — clear so the badge
+                // doesn't render forever.
+                self.preview_job = None;
             }
         }
     }
@@ -1350,15 +1461,14 @@ impl<'ta> App<'ta> {
 // ─── Event handling ──────────────────────────────────────────────────────────
 
 fn on_key(app: &mut App<'_>, key: KeyEvent) {
-    // Ctrl-C: prefer to interrupt a running query first; only quit if
-    // there's nothing to cancel. v0.12 refinement — a long ANALYZE
-    // against a multi-GB file used to leave users with no escape:
-    // first Ctrl-C would drop them out of the TUI entirely, second
-    // Ctrl-C would do nothing because the process was already gone.
-    // Now Ctrl-C cancels the analyze; a follow-up Ctrl-C (with no
-    // job running) quits as before.
+    // Ctrl-C: prefer to interrupt a running query first; only quit
+    // if there's nothing to cancel. v0.13 — preview is now async, so
+    // Ctrl-C cancels it too. Order: preview > analyze > quit. The
+    // distinction matters when both are running (preview kicked off
+    // by typing, analyze kicked off by E): Ctrl-C kills the cheaper
+    // / more recent thing first so the user can iterate quickly.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if app.cancel_analyze() {
+        if app.cancel_preview() || app.cancel_analyze() {
             return;
         }
         app.should_quit = true;
@@ -1379,7 +1489,10 @@ fn on_key(app: &mut App<'_>, key: KeyEvent) {
     // normal "drop focus" behavior on the second press. We don't
     // shortcut Tab/BackTab so the user can keep navigating panels even
     // while the worker thread is alive in the background.
-    if key.code == KeyCode::Esc && app.cancel_analyze() {
+    // v0.13 — Esc cancels in-flight preview / analyze before doing
+    // anything panel-specific. Same priority as Ctrl-C: preview >
+    // analyze > fall through to per-panel handling.
+    if key.code == KeyCode::Esc && (app.cancel_preview() || app.cancel_analyze()) {
         return;
     }
     if key.code == KeyCode::Tab {
@@ -1793,7 +1906,17 @@ fn render_columns(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
 
 fn render_query(f: &mut ratatui::Frame, app: &mut App<'_>, area: Rect) {
     let active = app.focus == Panel::Query;
-    let title = if let Some(err) = &app.preview.error {
+    // v0.13: when the preview worker is running, show "running 1.2s"
+    // in the header. Without this badge a slow remote scan would
+    // look indistinguishable from "TUI hung" — even though the
+    // event loop is still ticking and the result will land
+    // asynchronously. Badge takes priority over the previous
+    // result's last_ms / error so the user knows which numbers are
+    // fresh.
+    let title = if let Some(job) = &app.preview_job {
+        let secs = job.started_at.elapsed().as_secs_f32();
+        format!(" Query · running {:.1}s · Esc/Ctrl-C cancels ", secs)
+    } else if let Some(err) = &app.preview.error {
         format!(" Query · ⚠ {} ", err.lines().next().unwrap_or(""))
     } else {
         format!(" Query · {} ms ", app.preview.last_ms)
@@ -2655,9 +2778,7 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
         Line::from(Span::raw(
             "  group_by .country | count             — count per group",
         )),
-        Line::from(Span::raw(
-            "  group_by .c | sum .rev | having sum_rev > 1k",
-        )),
+        Line::from(Span::raw("  group_by .c | sum .rev | having sum_rev > 1k")),
         Line::from(Span::raw(
             "  count_distinct .user_id               — uniq aggregate",
         )),
@@ -2674,7 +2795,10 @@ fn render_help(f: &mut ratatui::Frame, full: Rect) {
             "  to_csv / to_json (= to_ndjson, to_jsonl)  — line per row",
         )),
         Line::from(""),
-        Line::from(Span::styled("Nested paths (v0.10) + chained UNNEST (v0.11)", bold)),
+        Line::from(Span::styled(
+            "Nested paths (v0.10) + chained UNNEST (v0.11)",
+            bold,
+        )),
         Line::from(Span::raw(
             "  .events[0].kind                       — list index, jq 0-idx",
         )),
@@ -2762,19 +2886,21 @@ pub fn run(
     result
 }
 
-fn run_app(terminal: &mut Tui, app: &mut App<'_>, conn: &Connection) -> Result<()> {
+fn run_app(terminal: &mut Tui, app: &mut App<'_>, _conn: &Connection) -> Result<()> {
     loop {
         terminal.draw(|f| render(f, app))?;
 
-        // Throttled compile: poll with a short timeout so the typing feels live.
+        // Throttled compile: poll with a short timeout so the typing
+        // feels live. While ANALYZE or preview is in flight, poll
+        // faster so the elapsed timer in the panel header ticks
+        // smoothly and finished results show up within ~50 ms.
         let timeout = match app.pending_compile_at {
             Some(t) => t
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(20)),
-            // While ANALYZE is in flight, poll faster so the elapsed
-            // timer in the panel header ticks smoothly and finished
-            // results show up within ~50 ms instead of ~200.
-            None if app.analyze_job.is_some() => Duration::from_millis(50),
+            None if app.preview_job.is_some() || app.analyze_job.is_some() => {
+                Duration::from_millis(50)
+            }
             None => Duration::from_millis(200),
         };
 
@@ -2786,11 +2912,12 @@ fn run_app(terminal: &mut Tui, app: &mut App<'_>, conn: &Connection) -> Result<(
             }
         }
 
-        app.maybe_run_compile(conn);
-        // Pull any completed ANALYZE result off the worker channel.
-        // Cheap (single non-blocking try_recv) so it's fine to call
-        // every tick — keeps result latency under one event-poll
-        // timeout (~200 ms) without forcing a wakeup-on-completion.
+        app.maybe_run_compile();
+        // Pull any completed preview / ANALYZE result off the worker
+        // channels. Cheap (single non-blocking try_recv each) so it's
+        // fine to call every tick — keeps result latency under one
+        // event-poll timeout without forcing a wakeup-on-completion.
+        app.poll_preview();
         app.poll_analyze();
 
         // Auto-clear flash messages after 3s.
@@ -3725,7 +3852,10 @@ TABLE_SCAN
             cli.contains("--udf 'is_us(c) := c = '\\''US'\\'''"),
             "missing first udf in {cli}"
         );
-        assert!(cli.contains("--udf 'shout(s) := upper(s)'"), "missing second udf in {cli}");
+        assert!(
+            cli.contains("--udf 'shout(s) := upper(s)'"),
+            "missing second udf in {cli}"
+        );
     }
 
     // ── v0.11: schema fetch + preview compile route through the format,
@@ -3742,12 +3872,8 @@ TABLE_SCAN
         let path = dir.path().join("tiny.ndjson");
         std::fs::write(&path, "{\"a\":1,\"b\":\"x\"}\n{\"a\":2,\"b\":\"y\"}\n").unwrap();
         let conn = Connection::open_in_memory().expect("open conn");
-        let cols = fetch_schema(
-            &conn,
-            path.to_str().unwrap(),
-            InputFormat::Ndjson,
-        )
-        .expect("schema");
+        let cols =
+            fetch_schema(&conn, path.to_str().unwrap(), InputFormat::Ndjson).expect("schema");
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
     }
@@ -3772,7 +3898,11 @@ TABLE_SCAN
             InputFormat::Ndjson,
             50,
         );
-        assert!(preview.error.is_none(), "preview errored: {:?}", preview.error);
+        assert!(
+            preview.error.is_none(),
+            "preview errored: {:?}",
+            preview.error
+        );
         assert!(
             preview.sql.contains("read_json("),
             "expected read_json in compiled sql, got: {}",

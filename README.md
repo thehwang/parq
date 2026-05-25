@@ -484,46 +484,64 @@ escape hatch is always available:
 pq events.parquet 'SELECT user_id, list_filter(events, e -> e.amount > 5) AS big FROM FILE'
 ```
 
-## Big-file mode (v0.12)
+## Big-file mode (v0.12 + v0.13)
 
-`pq` now treats parquet files large enough to be painful as first-class
+`pq` treats parquet files large enough to be painful as first-class
 inputs — no flags required for the common cases:
 
 ```bash
-# Streaming output. ndjson / csv / raw-line outputs ship rows to stdout
-# the moment DuckDB hands them over — `pq -o ndjson huge.parquet '.user_id' | head -1`
-# returns instantly even on a 40 GB file. Pre-v0.12 we collected every
-# row into memory before emitting any of them.
+# Streaming output (v0.12). ndjson / csv / raw-line outputs ship rows
+# to stdout the moment DuckDB hands them over — returns instantly
+# even on a 40 GB file. Pre-v0.12 we collected every row into memory
+# before emitting any of them.
 pq -o ndjson huge.parquet '.user_id' | head -1
 
-# Metadata-only count for parquet. Auto-on when the file is ≥ 1 GB
-# (override with `PQ_LITE_THRESHOLD=<bytes>`); force it explicitly
-# with --lite. Skips the data scan and reads num_rows from each
-# file's footer — orders of magnitude faster on big files.
+# Metadata-only count for parquet (v0.12). Auto-on when the file is
+# ≥ 1 GB (override with `PQ_LITE_THRESHOLD=<bytes>`); force with
+# --lite. Skips the data scan and reads num_rows from each file's
+# footer — orders of magnitude faster on big files.
 pq count huge.parquet              # auto-lite if >= 1 GB
 pq count --lite glob/*.parquet     # always lite, even on small files
 
-# Cancel mid-query with Ctrl-C. CLI: SIGINT is forwarded to DuckDB's
-# `interrupt_handle.interrupt()`, which unwinds within milliseconds
-# instead of hanging on a multi-GB scan. Second Ctrl-C exits hard
-# (130) in case interrupt() itself blocks on a slow network read.
+# Metadata-only column stats (v0.13). Same idea as count --lite,
+# now for `stats`: per-column min / max / nulls / row count straight
+# from each row-group's footer, no decompression. Trade-off:
+# `approx_distinct` and `null_pct` are unavailable in lite mode —
+# those need the data.
+pq stats --lite huge.parquet       # sub-second on a 30 GB file
+
+# Stderr progress spinner (v0.13). Draws after a 300 ms hold-off
+# when stderr is a TTY and the query is still running; clears
+# itself on completion. Pipelines and CI logs are unaffected.
+pq events.parquet 'group_by .events[].kind | count'
+# stderr: ⠋  4.2s elapsed — Ctrl-C to cancel
+pq events.parquet '...' --no-progress    # opt out
+PQ_NO_PROGRESS=1 pq events.parquet '...' # env equivalent
+
+# Cancel mid-query with Ctrl-C (v0.12, CLI). SIGINT forwards to
+# DuckDB's `interrupt_handle.interrupt()`, which unwinds within
+# milliseconds instead of hanging on a multi-GB scan. Second Ctrl-C
+# exits hard (130) in case interrupt() blocks on a slow network read.
 pq events.parquet 'group_by .events[].kind | count' &
 sleep 0.5; kill -INT %1            # → "Query interrupted" + clean exit
 
-# Inside the TUI, Ctrl-C cancels a running EXPLAIN ANALYZE without
-# leaving the TUI; press Ctrl-C again to quit. Useful when the
-# Explain panel kicks off a 30 s analyze on a remote 12 GB file
-# and you decide you didn't actually need it.
+# TUI preview is fully async (v0.13). Type a query against a 12 GB
+# file and the event loop keeps ticking — the Query header shows
+# `running 1.2s · Esc/Ctrl-C cancels` while the worker thread runs.
+# Esc / Ctrl-C interrupts the in-flight preview before quitting.
 pq tui huge.parquet
+# (in TUI) edit the query freely; preview returns when ready
 # (in TUI) press E for analyze, Ctrl-C to cancel mid-run
 ```
 
 | Knob | Purpose |
 |---|---|
-| `--lite` (on `pq count`) | Force parquet metadata-only path |
+| `--lite` (`pq count` / `pq stats`) | Force parquet metadata-only path |
 | `PQ_LITE_THRESHOLD=<bytes>` | Override the 1 GB auto-lite threshold |
+| `--no-progress` / `PQ_NO_PROGRESS=1` | Suppress the stderr spinner |
+| `PQ_HTTP_TIMEOUT=<ms>` | Override the 15 s HTTPFS request timeout |
 | Ctrl-C (CLI) | First press = interrupt query; second press = exit 130 |
-| Ctrl-C (TUI) | Cancel running ANALYZE; press again with no job to quit |
+| Esc / Ctrl-C (TUI) | Cancel running preview / ANALYZE before quitting |
 
 For files that don't fit on the local disk, point `pq` at `gs://` /
 `s3://` / `https://` URLs — DuckDB's httpfs is bundled, and we set up
@@ -587,7 +605,30 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.12.1** (current)
+**v0.13** (current) — Big-file mode part 2
+- [x] **TUI preview is now async**. Pre-v0.13 every keystroke against a
+      12 GB file froze the entire event loop until DuckDB returned —
+      not even Ctrl-C got processed. We now spawn the preview on a
+      worker thread that owns its own connection and `InterruptHandle`;
+      the Query header shows `running 1.2s · Esc/Ctrl-C cancels` so a
+      slow scan looks like progress, not a hang. Esc / Ctrl-C
+      interrupts the in-flight job before quitting.
+- [x] **CLI stderr spinner**: a faint `⠋ 1.2s elapsed — Ctrl-C to
+      cancel` line draws on stderr after a 300 ms hold-off, only when
+      stderr is a TTY. Pipelines (`pq … | jq …`) and CI logs see
+      nothing. Opt out with `--no-progress` or `PQ_NO_PROGRESS=1`.
+- [x] **`pq stats --lite`** reads column min/max/null counts from the
+      parquet footer's per-row-group statistics — no decompression,
+      no scan. On a 30 GB file: sub-second instead of minutes.
+      Auto-on for local parquet ≥ 1 GB, force with `--lite`. Lite
+      mode reports `rows` and `nulls` per column but skips the
+      data-scan-only `approx_distinct` / `null_pct` so callers know
+      they didn't get an exact distinct count.
+- [x] **HTTP timeouts**: a stuck `gs://` / `s3://` request now unblocks
+      within 15 s of an interrupt instead of the DuckDB default 30 s.
+      Override with `PQ_HTTP_TIMEOUT=<ms>`.
+
+**v0.12.1**
 - [x] `pq … | head -1` no longer prints `Error: Broken pipe (os error 32)`.
       Rust's runtime ignores SIGPIPE by default, which only matters once we
       started streaming output in v0.12 — pre-streaming, the producer
@@ -689,22 +730,16 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's coming
 
-**v0.13 — Big-file mode part 2**
-- [ ] TUI preview runs in a worker thread (today it blocks the event loop —
-      type a query against a 12 GB file and the TUI freezes). Will hold
-      its own `interrupt_handle` so Ctrl-C cancels there too.
-- [ ] CLI stderr spinner / elapsed timer for queries > N ms (off by default
-      when stderr is a pipe, gated behind `--no-progress`).
+**v0.14 — Big-file polish**
+- [ ] Streaming JSON output (today JSON still buffers because of the
+      wrapping `[]`; a hand-written incremental array writer fixes it).
 - [ ] Explain panel surfaces row-group pruning from DuckDB's JSON profile
       (`operator_rows_scanned` / `operator_cardinality`) — "filter cut
       80 % of file before decompression"-style hints.
-- [ ] Streaming JSON output (today JSON still buffers because of the
-      wrapping `[]`; a hand-written incremental array writer fixes it).
-- [ ] `pq stats --lite` for parquet — read column min/max/null counts from
-      row-group metadata, no scan.
+- [ ] Schema diff: `pq diff a.parquet b.parquet` — column-level adds /
+      drops / type changes between two parquet files.
 
-**Beyond v0.13**
-- [ ] Schema diff: `pq diff a.parquet b.parquet`
+**Beyond v0.14**
 - [ ] Multi-file tabs in TUI with visual join builder
 - [ ] Query history with branching (every keystroke a frame, rewindable)
 - [ ] Conditional DSL (`if .x > 0 then 1 else 0 end`), regex sugar, date math
