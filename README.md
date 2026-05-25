@@ -6,11 +6,11 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.8:** `EXPLAIN ANALYZE` now runs off the UI thread — capital `E` returns instantly with a "running…" timer in the panel header, and `Esc` cancels mid-flight. Press `Ctrl-↑/Ctrl-↓` in the Query panel to browse persisted query history (`~/.pq/history`). Snapshot tests + a VHS smoke test guard the TUI in CI on every PR.
+> **New in v0.10 — first-class nested schema support.** `LIST` / `STRUCT` / `MAP` columns now render as proper JSON (was Rust-Debug strings) and the DSL grew jq-style sugar: `.tags[0]`, `.tags[]`, `.events[0].kind`, `.metadata["plan"]`, `len(.tags)`, `keys(.metadata)`. JSON output now preserves projection order (was alphabetical).
 >
-> _v0.7: Homebrew tap (`brew install thehwang/parq/pq`) and `EXPLAIN ANALYZE` on demand. v0.6: semantic sync, schema completion, drill-down, heuristic-hint Explain panel. v0.5: the TUI itself._
+> _v0.9.1: `to_ndjson` / `to_jsonl` aliases. v0.9: stdin auto-spool (`cat f.parquet | pq -`) + `-i ndjson` chains. v0.8: async `EXPLAIN ANALYZE`, persisted query history. v0.7: Homebrew tap. v0.6: semantic sync + Explain panel. v0.5: the TUI._
 >
-> Already on Homebrew? `brew upgrade pq` to grab v0.8.
+> Already on Homebrew? `brew update && brew upgrade pq` to grab v0.10.
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -25,6 +25,16 @@ $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
 ```
 
 ![demo](assets/demo.gif)
+
+## Documentation
+
+- 📘 [**Tutorial**](doc/tutorial.md) — 30-minute hands-on walkthrough.
+  Setup, the DSL pipeline mental model, nested types, unix-pipe composition,
+  TUI usage, big-file mode (v0.12 + v0.13). Read this first.
+- 📚 [**Reference manual**](doc/reference.md) — feature-by-feature lookup
+  catalogue: every DSL stage, every TUI key binding, every env var, every
+  output format. Use this when you know what you want to do but need the
+  exact syntax.
 
 ## Why?
 
@@ -396,6 +406,199 @@ filter_expr  := <DuckDB SQL fragment>            -- with sugar:
                   bare .col → col
 ```
 
+## Nested schema (v0.10) + chained UNNEST (v0.11)
+
+Parquet's everyday nested types (`LIST`, `STRUCT`, `MAP`) are first
+class. The renderer emits proper JSON for them, and the DSL gained
+jq-style bracket sugar so you don't have to drop into raw SQL:
+
+| pq DSL | DuckDB SQL | Notes |
+|---|---|---|
+| `.user.name` | `user.name` | STRUCT field — already worked, kept naming |
+| `.tags[0]` | `tags[1]` | LIST index — pq accepts jq's 0-indexed, translates to DuckDB's 1-indexed |
+| `.tags[-1]` | `tags[-1]` | last element (DuckDB native) |
+| `.tags[]` | `UNNEST(tags) AS tags` | row explosion — projection only |
+| `.events[0].kind` | `events[1].kind` | LIST&lt;STRUCT&gt; — index then field |
+| `.events[].kind` | `_pq_u0.kind` (with hoisted FROM) | **v0.11** — chained UNNEST, see below |
+| `.metadata["plan"]` | `element_at(metadata, 'plan')[1]` | MAP value lookup |
+| `len(.tags)` | `len(tags)` | length |
+| `keys(.metadata)` | `map_keys(metadata)` | MAP keys |
+| `values(.metadata)` | `map_values(metadata)` | MAP values |
+
+### Chained UNNEST (v0.11)
+
+`.events[].kind` reads "explode the events array, then take `.kind` of
+each row". DuckDB rejects raw `UNNEST(events).kind` in any clause that
+also has `GROUP BY` / `WHERE` / `HAVING` / `ORDER BY` — the dreaded
+`Binder Error: UNNEST not supported here`. v0.11 fixes that uniformly:
+every chained `UNNEST(...)` is hoisted into a derived FROM subquery
+and rewritten to a `_pq_u<i>` alias, so the outer SELECT only ever
+sees plain columns.
+
+```bash
+# group_by + count + sort, with row explosion. Just works in v0.11.
+pq events.parquet 'group_by .events[].kind | count | sort by .count desc'
+# {"events_kind":"click","count":2}
+# {"events_kind":"buy","count":1}
+
+# sum across exploded rows
+pq events.parquet 'group_by .events[].kind | sum .events[].amount'
+# {"events_kind":"buy","sum_events_amount":9.0}
+# {"events_kind":"click","sum_events_amount":2.0}
+
+# WHERE on a chained UNNEST — also lifted, also legal.
+pq events.parquet 'where .events[].kind == "click" | .user_id, .events[].amount'
+
+# Repeated references to the same exploded list share one UNNEST,
+# so `.events[].kind, .events[].amount` produces N rows (not N²).
+pq events.parquet '.events[].kind, .events[].amount'
+```
+
+The compiled SQL is visible via `--explain` if you want to confirm
+the lifting:
+
+```sql
+SELECT _pq_u0.kind AS events_kind, count(*) AS count
+FROM (SELECT *, UNNEST(events) AS _pq_u0 FROM read_parquet('events.parquet')) AS _pq_src
+GROUP BY _pq_u0.kind
+ORDER BY count DESC
+```
+
+```bash
+# Real example — events.parquet has events: LIST<STRUCT(kind, amount)>
+pq events.parquet '.user_id, .events[0].kind, .events[0].amount'
+# {"user_id":1,"events_0_kind":"click","events_0_amount":1.0}
+
+# Row-explode a scalar array column
+pq events.parquet '.user_id, .events[]'
+# {"user_id":1,"events":{"kind":"click","amount":1.0}}
+# {"user_id":1,"events":{"kind":"buy","amount":9.0}}
+
+# MAP key access in WHERE
+pq users.parquet 'where .metadata["plan"] == "pro"'
+
+# Nested types chain through ndjson cleanly
+pq events.parquet '.user_id, .events | to_json' \
+  | pq -i ndjson - 'where len(.events) > 0 | count'
+```
+
+JSON output preserves projection order (the JSON object keys appear in
+the order you wrote in the SELECT list, top-level and nested) — useful
+when downstream code makes positional assumptions.
+
+For anything `pq`'s sugar doesn't cover (list comprehensions, complex
+MAP filters, list_filter / list_transform with lambdas), the raw SQL
+escape hatch is always available:
+
+```bash
+pq events.parquet 'SELECT user_id, list_filter(events, e -> e.amount > 5) AS big FROM FILE'
+```
+
+## Big-file mode (v0.12 + v0.13)
+
+`pq` treats parquet files large enough to be painful as first-class
+inputs — no flags required for the common cases:
+
+```bash
+# Streaming output (v0.12). ndjson / csv / raw-line outputs ship rows
+# to stdout the moment DuckDB hands them over — returns instantly
+# even on a 40 GB file. Pre-v0.12 we collected every row into memory
+# before emitting any of them.
+pq -o ndjson huge.parquet '.user_id' | head -1
+
+# Metadata-only count for parquet (v0.12). Auto-on when the file is
+# ≥ 1 GB (override with `PQ_LITE_THRESHOLD=<bytes>`); force with
+# --lite. Skips the data scan and reads num_rows from each file's
+# footer — orders of magnitude faster on big files.
+pq count huge.parquet              # auto-lite if >= 1 GB
+pq count --lite glob/*.parquet     # always lite, even on small files
+
+# Metadata-only column stats (v0.13). Same idea as count --lite,
+# now for `stats`: per-column min / max / nulls / row count straight
+# from each row-group's footer, no decompression. Trade-off:
+# `approx_distinct` and `null_pct` are unavailable in lite mode —
+# those need the data.
+pq stats --lite huge.parquet       # sub-second on a 30 GB file
+
+# Stderr progress spinner (v0.13). Draws after a 300 ms hold-off
+# when stderr is a TTY and the query is still running; clears
+# itself on completion. Pipelines and CI logs are unaffected.
+pq events.parquet 'group_by .events[].kind | count'
+# stderr: ⠋  4.2s elapsed — Ctrl-C to cancel
+pq events.parquet '...' --no-progress    # opt out
+PQ_NO_PROGRESS=1 pq events.parquet '...' # env equivalent
+
+# Cancel mid-query with Ctrl-C (v0.12, CLI). SIGINT forwards to
+# DuckDB's `interrupt_handle.interrupt()`, which unwinds within
+# milliseconds instead of hanging on a multi-GB scan. Second Ctrl-C
+# exits hard (130) in case interrupt() blocks on a slow network read.
+pq events.parquet 'group_by .events[].kind | count' &
+sleep 0.5; kill -INT %1            # → "Query interrupted" + clean exit
+
+# TUI preview is fully async (v0.13). Type a query against a 12 GB
+# file and the event loop keeps ticking — the Query header shows
+# `running 1.2s · Esc/Ctrl-C cancels` while the worker thread runs.
+# Esc / Ctrl-C interrupts the in-flight preview before quitting.
+pq tui huge.parquet
+# (in TUI) edit the query freely; preview returns when ready
+# (in TUI) press E for analyze, Ctrl-C to cancel mid-run
+```
+
+| Knob | Purpose |
+|---|---|
+| `--lite` (`pq count` / `pq stats`) | Force parquet metadata-only path |
+| `PQ_LITE_THRESHOLD=<bytes>` | Override the 1 GB auto-lite threshold |
+| `--no-progress` / `PQ_NO_PROGRESS=1` | Suppress the stderr spinner |
+| `PQ_HTTP_TIMEOUT=<ms>` | Override the 15 s HTTPFS request timeout |
+| Ctrl-C (CLI) | First press = interrupt query; second press = exit 130 |
+| Esc / Ctrl-C (TUI) | Cancel running preview / ANALYZE before quitting |
+
+For files that don't fit on the local disk, point `pq` at `gs://` /
+`s3://` / `https://` URLs — DuckDB's httpfs is bundled, and we set up
+credentials from `AWS_*` / `PQ_GCS_*` env vars automatically. Lite-mode
+auto-detection only fires for local paths (size detection over the
+network is a footgun); pass `--lite` explicitly for cloud parquet.
+
+## Shell primitive (v0.9)
+
+`pq` reads stdin as a first-class source so it composes with `cat`, `aws s3 cp`,
+`gsutil cp`, `kubectl logs`, and any other command that writes structured data:
+
+```bash
+# Parquet over a pipe — pq drains the non-seekable fd to a tempfile
+# automatically (DuckDB's footer-trailer reader needs random access).
+cat data.parquet | pq - 'group_by .country | count'
+
+# Stream from cloud blob storage without a local file.
+aws s3 cp s3://my-bucket/sales.parquet - | pq - 'sum .revenue'
+
+# Chain pq invocations through ndjson — self-describing schema, no
+# column-order surprises. -i ndjson tells pq to use read_json.
+pq sales.parquet '.country, .revenue | to_json' \
+  | pq -i ndjson - 'group_by .country | sum .revenue | top 5 by sum_revenue'
+
+# Or chain through CSV (use -o csv on the producer to keep the header).
+pq -o csv sales.parquet '.email, .country' \
+  | pq -i csv - '.country | distinct'
+
+# Mix with jq / awk freely — everything pq emits is line-oriented.
+# (pq's `to_json` already emits one JSON object per row — that's ndjson.)
+pq events.parquet '.user_id, .ts | to_json' \
+  | jq -c 'select(.ts > "2026-01-01")' \
+  | pq -i ndjson - 'count'
+```
+
+| Form | What pq does |
+|---|---|
+| `pq - < f.parquet` | seekable fd, reads in place (zero-copy) |
+| `cat f.parquet \| pq -` | non-seekable fd → spool to `/tmp/pq-stdin-*.parquet` |
+| `pq -i ndjson -` | stdin → spool with `.ndjson` suffix → `read_json(format='newline_delimited')` |
+| `pq -i csv -` | stdin → spool with `.csv` suffix → `read_csv_auto` |
+| `pq -i auto data.ndjson` | sniffs format from extension (default) |
+
+The spool tempfile lives in `$TMPDIR` (RAM-backed on macOS) and is deleted as
+soon as `pq` exits — no cleanup needed.
+
 ## Comparison
 
 ```
@@ -412,7 +615,94 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.5.1** (current)
+**v0.13** (current) — Big-file mode part 2
+- [x] **TUI preview is now async**. Pre-v0.13 every keystroke against a
+      12 GB file froze the entire event loop until DuckDB returned —
+      not even Ctrl-C got processed. We now spawn the preview on a
+      worker thread that owns its own connection and `InterruptHandle`;
+      the Query header shows `running 1.2s · Esc/Ctrl-C cancels` so a
+      slow scan looks like progress, not a hang. Esc / Ctrl-C
+      interrupts the in-flight job before quitting.
+- [x] **CLI stderr spinner**: a faint `⠋ 1.2s elapsed — Ctrl-C to
+      cancel` line draws on stderr after a 300 ms hold-off, only when
+      stderr is a TTY. Pipelines (`pq … | jq …`) and CI logs see
+      nothing. Opt out with `--no-progress` or `PQ_NO_PROGRESS=1`.
+- [x] **`pq stats --lite`** reads column min/max/null counts from the
+      parquet footer's per-row-group statistics — no decompression,
+      no scan. On a 30 GB file: sub-second instead of minutes.
+      Auto-on for local parquet ≥ 1 GB, force with `--lite`. Lite
+      mode reports `rows` and `nulls` per column but skips the
+      data-scan-only `approx_distinct` / `null_pct` so callers know
+      they didn't get an exact distinct count.
+- [x] **HTTP timeouts**: a stuck `gs://` / `s3://` request now unblocks
+      within 15 s of an interrupt instead of the DuckDB default 30 s.
+      Override with `PQ_HTTP_TIMEOUT=<ms>`.
+
+**v0.12.1**
+- [x] `pq … | head -1` no longer prints `Error: Broken pipe (os error 32)`.
+      Rust's runtime ignores SIGPIPE by default, which only matters once we
+      started streaming output in v0.12 — pre-streaming, the producer
+      finished before `head` closed its end of the pipe, so EPIPE never
+      surfaced. We now reset SIGPIPE to `SIG_DFL` in `main()`, matching the
+      conventional Unix behaviour of every other CLI tool.
+
+**v0.12** — Big-file mode
+- [x] Streaming output for ndjson / csv / raw-lines — rows go straight from
+      DuckDB's row cursor to stdout without ever filling a `Vec`. Memory
+      stays flat regardless of result-set size; `head -1` returns instantly.
+- [x] CLI Ctrl-C → `Connection::interrupt_handle().interrupt()`. A multi-GB
+      parquet scan unwinds within milliseconds with a clean error instead
+      of a half-stream + dirty exit. Second Ctrl-C falls through to a hard
+      exit 130 in case interrupt() blocks on a slow remote read.
+- [x] TUI Ctrl-C cancels an in-flight EXPLAIN ANALYZE before it touches
+      `should_quit`. Worker thread receives interrupt(), badge clears,
+      Explain panel falls back to its previous state. A second Ctrl-C
+      with no job running quits as before.
+- [x] `pq count --lite` (and auto-on for local parquet ≥ 1 GB) reads row
+      counts from `parquet_file_metadata(...)` instead of scanning. Glob
+      paths sum across files. Override the threshold via
+      `PQ_LITE_THRESHOLD=<bytes>`.
+
+**v0.11.1**
+- [x] Custom single-line table preset — clean `│ ─ ┌ ┐` charset (DuckDB-CLI style),
+      replaces `UTF8_FULL_CONDENSED`'s exotic `┆ ╞ ═ ╪ ╡` glyphs that some macOS
+      fonts mis-rendered and made tables look diagonally staggered
+- [x] TUI installs a panic hook + best-effort `teardown_terminal` — a panic in
+      the event loop no longer leaves your shell in raw mode after `pq tui`
+      exits (the symptom was every subsequent multi-line command rendering
+      stair-stepped until you ran `stty sane`)
+- [x] Cargo.toml version finally tracks the git tag — `pq --version` shows the
+      real release number, no more lag
+
+**v0.11**
+- [x] Custom single-line table preset — clean `│ ─ ┌ ┐` charset (DuckDB-CLI style),
+      replaces `UTF8_FULL_CONDENSED`'s exotic `┆ ╞ ═ ╪ ╡` glyphs that some macOS
+      fonts mis-rendered and made tables look diagonally staggered
+- [x] TUI installs a panic hook + best-effort `teardown_terminal` — a panic in
+      the event loop no longer leaves your shell in raw mode after `pq tui`
+      exits (the symptom was every subsequent multi-line command rendering
+      stair-stepped until you ran `stty sane`)
+- [x] Cargo.toml version finally tracks the git tag — `pq --version` shows the
+      real release number, no more lag
+
+**v0.11**
+- [x] Chained UNNEST sugar: `.events[].kind` works in `select / where / group_by /
+      having / order_by` — full LIST<STRUCT> path navigation in any clause
+- [x] `count_distinct(.x)`, multi-arg aggregates, and `top N by` interplay with
+      chained-UNNEST aliases
+
+**v0.10**
+- [x] Nested schema as a first-class citizen — `value_to_json` recurses into
+      LIST / STRUCT / MAP, so JSON / NDJSON output round-trips cleanly
+- [x] Path tokens accept `[N]` (jq 0-indexed → DuckDB 1-indexed), `[]`, `["key"]`,
+      `len(.foo)`, `.foo | length`, `keys(.foo)`
+- [x] Function-style projections (`keys(.metadata)`) parse as projections, not
+      WHERE filters
+- [x] Per-subcommand `-i/--input`, `-n`, `--udf` flags — `pq tui -i ndjson FILE`
+      now parses correctly (was a clap `args_conflicts_with_subcommands` quirk)
+- [x] Timestamps render as ISO-8601 strings, not `timestamp(<micros>)` debug
+
+**v0.5.1**
 - [x] S3 `credential_chain` fallback — `AWS_PROFILE`, `~/.aws/credentials`, SSO,
       EC2 IMDS, and ECS task role now Just Work without setting `AWS_ACCESS_KEY_ID`
 
@@ -450,20 +740,21 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's coming
 
-**v0.6 — TUI depth pass**
-- [ ] Semantic cursor sync — column lineage highlighting across all panels
-- [ ] `Y` truly copies to clipboard (arboard with feature flag for headless builds)
-- [ ] Horizontal scroll in Data panel for long-string columns
-- [ ] Real-time row count (currently shows "preview rows", not full count)
-- [ ] `Filters` panel becomes interactive (drop a filter with `d`, edit with `e`)
-- [ ] Explain panel with `EXPLAIN ANALYZE` + heuristic hints (zonemap pruning, projection PD)
-- [ ] Drill-down: Enter on an aggregate cell → auto-generates `where` for underlying rows
-- [ ] DuckDB GCS `credential_chain` ADC support once duckdb#22413 lands
+**v0.14 — Big-file polish**
+- [ ] Streaming JSON output (today JSON still buffers because of the
+      wrapping `[]`; a hand-written incremental array writer fixes it).
+- [ ] Explain panel surfaces row-group pruning from DuckDB's JSON profile
+      (`operator_rows_scanned` / `operator_cardinality`) — "filter cut
+      80 % of file before decompression"-style hints.
+- [ ] Schema diff: `pq diff a.parquet b.parquet` — column-level adds /
+      drops / type changes between two parquet files.
 
-**v0.7+**
+**Beyond v0.14**
+- [ ] Multi-file tabs in TUI with visual join builder
 - [ ] Query history with branching (every keystroke a frame, rewindable)
-- [ ] Schema diff between two parquet files
-- [ ] Multi-file tabs with visual join builder
+- [ ] Conditional DSL (`if .x > 0 then 1 else 0 end`), regex sugar, date math
+- [ ] "Did you mean .country?" typo suggestions on column-not-found errors
+- [ ] DuckDB GCS `credential_chain` ADC support once duckdb#22413 lands
 
 ## Limitations (v0)
 

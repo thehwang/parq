@@ -1,6 +1,6 @@
 ---
 source: src/tui.rs
-assertion_line: 3666
+assertion_line: 3772
 ---
 ┌ Columns · 3 ─────────────┐┌ Query · 12 ms ─────────────────────────────────────────────────────────────────┐
 │▶ ★ id  BIGINT            ││ try: '.email, .country where .country == "US"' or 'group_by .country | count'  │
@@ -8,7 +8,7 @@ assertion_line: 3666
 │    revenue  DOUBLE       ││                                                                                │
 │                          ││                                                                                │
 │                          │└────────────────────────────────────────────────────────────────────────────────┘
-│                          │┌ Data · 3 of 3 rows shown ──────────────────────────────────────────────────────┐
+│                          │┌ Data · 3 rows ─────────────────────────────────────────────────────────────────┐
 │                          ││country  revenue                                                                │
 │                          ││US        100.50                                                                │
 │                          ││DE         85.00                                                                │

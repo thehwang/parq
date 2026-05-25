@@ -1,6 +1,6 @@
 [package]
 name = "pq"
-version = "0.8.0"
+version = "0.13.0"
 edition = "2021"
 description = "jq for Parquet — query parquet files with a concise expression syntax"
 authors = ["Hua Wang <thehwang@users.noreply.github.com>"]
@@ -21,7 +21,7 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 duckdb = { version = "1.1", features = ["bundled", "json"] }
 anyhow = "1.0"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 comfy-table = "7.1"
 colored = "2.1"
 # tui-textarea 0.7 is built against ratatui 0.29 / crossterm 0.28 — keep these
@@ -33,6 +33,25 @@ crossterm = "0.28"
 # (semantic sync, v0.6). It pulls in the `regex` crate transitively, but
 # we already escape user input in regex_escape() so the surface is safe.
 tui-textarea = { version = "0.7", features = ["search"] }
+# v0.9: stdin auto-spool. When the user pipes a parquet file in
+# (`cat f.parquet | pq -`) the resulting fd is a pipe — DuckDB's
+# parquet reader needs random access (footer-trailer format) and
+# rejects pipes with ESPIPE. We drain to a NamedTempFile so the
+# DuckDB-side path is a normal seekable file. Tempfile cleans up on
+# drop. Pulled in by other deps already; making it explicit is free.
+tempfile = "3"
+# v0.9: detect whether stdin is seekable (regular file, e.g. shell
+# `<` redirect) vs a pipe — used to skip the spool for the redirect
+# case. Already a transitive dep through tempfile / duckdb-rs.
+libc = "0.2"
+# v0.12: SIGINT handling for big-file mode. Ctrl-C during a long
+# DuckDB scan calls `Connection::interrupt_handle().interrupt()`
+# instead of just killing the process — gives DuckDB a chance to
+# unwind cleanly and surface a "Query interrupted" error. Second
+# Ctrl-C falls back to immediate exit, in case interrupt() takes
+# too long. ctrlc is a tiny wrapper around signal-hook with no
+# unsafe in our call path.
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [dev-dependencies]
 # v0.8 snapshot tests for the TUI rendering. We feed a fake App into
