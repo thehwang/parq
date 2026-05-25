@@ -2,10 +2,12 @@
 
 > `pq` is a Rust single-binary CLI that embeds DuckDB to query Parquet files
 > with a jq-style DSL. This document is the **lookup-style reference
-> manual**: feature-by-feature, non-linear, current through v0.13.
+> manual**: feature-by-feature, non-linear, current through v0.14.
 > Big-file specifics (streaming output, Ctrl-C, `count --lite` /
 > `stats --lite`, async TUI preview, stderr spinner) live in
-> [§13](#13-big-file-mode-v012--v013).
+> [§13](#13-big-file-mode-v012--v013); v0.14's three features
+> (streaming JSON, row-group pruning ratio, `pq diff`) live in
+> [§14](#14-v014-finish-up).
 
 > **First time with pq?** Read [`tutorial.md`](./tutorial.md) instead —
 > a 30-minute hands-on walkthrough that takes you from "what is pq" to
@@ -71,6 +73,10 @@
   - [13.7 Stderr progress spinner (v0.13)](#137-stderr-progress-spinner-v013)
   - [13.8 HTTPFS timeout (v0.13)](#138-httpfs-timeout-v013)
   - [13.9 Environment-variable summary](#139-environment-variable-summary)
+- [**14. v0.14 finish-up**](#14-v014-finish-up)
+  - [14.1 Streaming JSON output](#141-streaming-json-output)
+  - [14.2 Row-group pruning ratio in Explain panel](#142-row-group-pruning-ratio-in-explain-panel)
+  - [14.3 `pq diff` — schema drift detection](#143-pq-diff--schema-drift-detection)
 
 ---
 
@@ -1028,3 +1034,161 @@ CLI knobs that pair with the above:
 |---------------------------------------|--------------------------------|----------------------------------------------------|
 | `--lite`                              | `pq count`, `pq stats`         | force metadata-only path regardless of size        |
 | `--no-progress`                       | global (works on all subcommands) | identical to `PQ_NO_PROGRESS=1`                    |
+
+---
+
+## 14. v0.14 finish-up
+
+Three feature blocks shipping together: streaming JSON closes a
+memory-shape gap from v0.12; row-group pruning gives the Explain
+panel an honest answer to "did my filter help?"; `pq diff` is a
+new CI-friendly subcommand for catching schema drift.
+
+### 14.1 Streaming JSON output
+
+Pre-v0.14 only **ndjson / csv / raw-lines** streamed. `-o json` had
+to buffer the entire result set in a `Vec` so the writer could wrap
+it in `[ … ]`. That meant a 12 GB query → 12 GB of RAM if you
+asked for JSON.
+
+v0.14 replaces the `Vec`-buffer with an incremental array writer:
+emit `[`, then `<row>`, then `,\n<row>` for the rest, then `]`.
+Memory stays flat, `head -c` returns instantly, and the output is
+still a single valid JSON array (parses with `jq -s` /
+`json.loads()` without changes).
+
+```bash
+# Memory used: O(1) — was O(result-size).
+pq big.parquet '.id, .country' -o json | head -c 200
+
+# Round-trips through jq filtering.
+pq big.parquet '.id, .country' -o json | jq '.[0:5]'
+```
+
+No flags or env vars; the streaming path is unconditional.
+
+### 14.2 Row-group pruning ratio in Explain panel
+
+Press capital **`E`** in the TUI (Explain panel, ANALYZE mode) to
+run a real `EXPLAIN ANALYZE`. v0.14 adds a per-scan row:
+
+```
+● pruned: 80% (2.4k/12.0k rows)
+```
+
+Color-coded as a gauge:
+- **green** — `pruning_ratio ≥ 0.5` (the pruner skipped at least
+  half the rows; predicate pushdown is working well)
+- **gold** — `0 < pruning_ratio < 0.5` (some pruning, but lots of
+  rows still scanned — narrow your `where` if it matters)
+- **dim** — `pruning_ratio == 0` (no row groups skipped — usually
+  means the predicate column lacks min/max stats; see hint below)
+
+A new suggestion fires when **all** of these hold:
+- `EXPLAIN ANALYZE` mode (capital `E`)
+- a filter was pushed to the scan (`Filters:` line in the plan)
+- pruning ratio is exactly 0
+- the file has ≥ 1,000,000 rows
+
+```
+💡 filter `country = 'US'` didn't prune any row groups —
+   column may lack min/max stats (common for STRING from
+   older Spark writers)
+```
+
+The threshold (1M rows) suppresses the hint on tiny files where
+row-group pruning is physically impossible (single row group).
+
+**Implementation note** — pruning data comes from DuckDB's JSON
+profile (set via `enable_profiling='json'` +
+`profiling_mode='detailed'`). We pull `operator_rows_scanned` from
+the `READ_PARQUET` node and divide by total rows reported by
+`parquet_file_metadata(...)`. The PRAGMAs are reset between runs
+so subsequent preview ticks get the normal text plan. JSON-profile
+extraction is best-effort; on failure (older DuckDB, cloud paths,
+non-parquet sources) the panel falls back to its v0.13 shape.
+
+### 14.3 `pq diff` — schema drift detection
+
+```bash
+pq diff old.parquet new.parquet                     # markdown (default)
+pq diff old.parquet new.parquet --format json       # for tooling
+pq diff a.ndjson b.ndjson -i ndjson                 # ndjson / csv too
+```
+
+Compares two files' schemas column-by-column. Emits a markdown
+report (default) or JSON (`--format json`). **Exit code 1 on any
+drift, 0 on identical**, so it slots into CI without scripting.
+
+Markdown output groups changes by kind:
+
+```
+# Schema diff
+- a: `events_v1.parquet`
+- b: `events_v2.parquet`
+
+## Added (1)
+| column | type | nullable |
+|---|---|---|
+| `country` | `VARCHAR` | yes |
+
+## Dropped (1)
+| column | type | nullable |
+|---|---|---|
+| `legacy_id` | `BIGINT` | no |
+
+## Changed (1)
+| column | from | to |
+|---|---|---|
+| `amount` | `DOUBLE` (yes) | `DECIMAL(10,2)` (no) |
+```
+
+JSON output exposes the full classification, suitable for parsing
+in CI:
+
+```json
+{
+  "a": "events_v1.parquet",
+  "b": "events_v2.parquet",
+  "drift": true,
+  "added":   [{"name": "country",    "type": "VARCHAR",       "nullable": true}],
+  "dropped": [{"name": "legacy_id",  "type": "BIGINT",        "nullable": false}],
+  "changed": [{
+    "name": "amount",
+    "from": {"name": "amount", "type": "DOUBLE",         "nullable": true},
+    "to":   {"name": "amount", "type": "DECIMAL(10,2)",  "nullable": false}
+  }],
+  "unchanged_count": 7
+}
+```
+
+**Comparison rules**:
+
+- **Exact-string** type comparison (DuckDB's normalised
+  representation). `STRUCT(a INT, b VARCHAR)` and
+  `STRUCT(b VARCHAR, a INT)` count as different — usually the
+  right call for catching drift, but you'll see noise on
+  cosmetic struct-field reorderings.
+- **Nullability is significant**: same name + same type but
+  different nullability → reported as `Changed`. Adding NULL
+  values to a previously non-null column is a breaking change
+  for downstream consumers.
+- Output is **deterministic**: `a`'s columns first in their
+  original order (Same / Changed / Dropped), then `b`'s
+  added-only columns in their order. No hashmap-iteration flake
+  in CI logs.
+
+**CI gate example**:
+
+```yaml
+# .github/workflows/data.yml
+- name: Schema gate
+  run: |
+    pq diff baseline/events.parquet artifacts/events.parquet \
+      --format json > /tmp/diff.json
+    if jq -e '.drift' /tmp/diff.json > /dev/null; then
+      echo "::error::schema drift detected"
+      jq '.changed, .dropped' /tmp/diff.json
+      exit 1
+    fi
+```
