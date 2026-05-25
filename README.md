@@ -6,11 +6,11 @@
 
 Query parquet files with a concise expression syntax. Single binary, no JVM, no Python.
 
-> **New in v0.10 — first-class nested schema support.** `LIST` / `STRUCT` / `MAP` columns now render as proper JSON (was Rust-Debug strings) and the DSL grew jq-style sugar: `.tags[0]`, `.tags[]`, `.events[0].kind`, `.metadata["plan"]`, `len(.tags)`, `keys(.metadata)`. JSON output now preserves projection order (was alphabetical).
+> **New in v0.14 — Big-file finish-up.** Streaming JSON output (no more `Vec`-buffering for `-o json`). The Explain panel surfaces row-group pruning ratio per scan from DuckDB's JSON profile, and a new `pq diff a.parquet b.parquet` catches column-level schema drift in markdown or JSON, exit-coding non-zero so it slots into CI gates.
 >
-> _v0.9.1: `to_ndjson` / `to_jsonl` aliases. v0.9: stdin auto-spool (`cat f.parquet | pq -`) + `-i ndjson` chains. v0.8: async `EXPLAIN ANALYZE`, persisted query history. v0.7: Homebrew tap. v0.6: semantic sync + Explain panel. v0.5: the TUI._
+> _v0.13: async TUI preview, stderr spinner, `pq stats --lite`. v0.12: streaming output + Ctrl-C + `pq count --lite`. v0.10: first-class nested schema (LIST / STRUCT / MAP). v0.9: stdin auto-spool. v0.8: async EXPLAIN ANALYZE. v0.5: the TUI._
 >
-> Already on Homebrew? `brew update && brew upgrade pq` to grab v0.10.
+> Already on Homebrew? `brew update && brew upgrade pq` to grab v0.14.
 
 ```bash
 $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
@@ -30,7 +30,7 @@ $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
 
 - 📘 [**Tutorial**](doc/tutorial.md) — 30-minute hands-on walkthrough.
   Setup, the DSL pipeline mental model, nested types, unix-pipe composition,
-  TUI usage, big-file mode (v0.12 + v0.13). Read this first.
+  TUI usage, big-file mode (v0.12 + v0.13), schema-diff in CI (v0.14). Read this first.
 - 📚 [**Reference manual**](doc/reference.md) — feature-by-feature lookup
   catalogue: every DSL stage, every TUI key binding, every env var, every
   output format. Use this when you know what you want to do but need the
@@ -615,7 +615,32 @@ streams large files   ✓        ✓            ✓      partial   ✓
 
 ## What's done
 
-**v0.13** (current) — Big-file mode part 2
+**v0.14** (current) — Big-file finish-up
+- [x] **Streaming JSON output**. Pre-v0.14 only ndjson / csv streamed —
+      `-o json` had to buffer the whole result set in a `Vec` to wrap
+      it in `[]`. Now we write `[`, the first row, then `,\n` + each
+      subsequent row, then `]`. Memory stays flat regardless of result
+      size; `pq big.parquet -o json | head -c 200` returns instantly.
+- [x] **Explain panel shows row-group pruning ratio**. Press capital
+      `E` in the TUI: `● pruned: 80% (2.4k/12.0k rows)` appears under
+      each scan, color-coded (green ≥50% / gold >0% / dim 0%). Pulled
+      from DuckDB's JSON profile (`operator_rows_scanned`) merged with
+      `parquet_file_metadata(...)` for the file's true row count.
+      A new suggestion fires when the pruner skipped exactly 0% on a
+      filtered query against a >1M-row file — usually means the
+      predicate column lacks min/max stats (common for `STRING` from
+      older Spark writers).
+- [x] **`pq diff a.parquet b.parquet`** — column-level schema drift in
+      markdown (default) or JSON (`--format json`). Exits 1 on drift,
+      0 on identical, so it slots into CI gates. Detects added /
+      dropped columns, type changes, and nullability changes (the
+      last is breaking for downstream consumers — flagged separately).
+      Works on parquet, ndjson, and csv inputs.
+- [x] **CI: `tui smoke (vhs)` no longer flaky**. Ubuntu 24.04 runners
+      stopped shipping `ttyd` in their default repos; we now apt-install
+      it explicitly with a curl-from-upstream fallback.
+
+**v0.13** — Big-file mode part 2
 - [x] **TUI preview is now async**. Pre-v0.13 every keystroke against a
       12 GB file froze the entire event loop until DuckDB returned —
       not even Ctrl-C got processed. We now spawn the preview on a
@@ -739,15 +764,6 @@ streams large files   ✓        ✓            ✓      partial   ✓
 - [x] Pipe stages with WHERE/HAVING auto-routing
 
 ## What's coming
-
-**v0.14 — Big-file polish**
-- [ ] Streaming JSON output (today JSON still buffers because of the
-      wrapping `[]`; a hand-written incremental array writer fixes it).
-- [ ] Explain panel surfaces row-group pruning from DuckDB's JSON profile
-      (`operator_rows_scanned` / `operator_cardinality`) — "filter cut
-      80 % of file before decompression"-style hints.
-- [ ] Schema diff: `pq diff a.parquet b.parquet` — column-level adds /
-      drops / type changes between two parquet files.
 
 **Beyond v0.14**
 - [ ] Multi-file tabs in TUI with visual join builder
