@@ -403,3 +403,135 @@ fn json_streaming_writes_brackets_and_separators() {
         );
     }
 }
+
+// ── v0.14: pq diff ─────────────────────────────────────────────────────────
+
+/// Write `contents` to a temporary file with extension `ext` and return
+/// the path. Caller is responsible for letting it be cleaned up at the
+/// end of the test (we use std::env::temp_dir + a unique name).
+fn write_temp_file(name: &str, contents: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pq-diff-test-{}-{name}", std::process::id()));
+    let mut f = std::fs::File::create(&path).expect("create temp");
+    f.write_all(contents.as_bytes()).expect("write temp");
+    path
+}
+
+#[test]
+fn diff_identical_ndjson_exits_zero() {
+    let pq = pq_binary();
+    if skip_if_missing(&pq, "pq binary") {
+        return;
+    }
+    let a = write_temp_file(
+        "same-a.ndjson",
+        "{\"id\": 1, \"name\": \"a\"}\n{\"id\": 2, \"name\": \"b\"}\n",
+    );
+    let b = write_temp_file(
+        "same-b.ndjson",
+        "{\"id\": 3, \"name\": \"c\"}\n{\"id\": 4, \"name\": \"d\"}\n",
+    );
+
+    let out = Command::new(&pq)
+        .args([
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-i",
+            "ndjson",
+        ])
+        .output()
+        .expect("pq diff");
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+
+    assert!(
+        out.status.success(),
+        "identical schemas must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No drift"),
+        "expected 'No drift' in stdout, got: {stdout}"
+    );
+}
+
+#[test]
+fn diff_drifted_ndjson_exits_one_with_added_section() {
+    let pq = pq_binary();
+    if skip_if_missing(&pq, "pq binary") {
+        return;
+    }
+    // b has a `country` field that a doesn't — schema drift.
+    let a = write_temp_file("drift-a.ndjson", "{\"id\": 1, \"name\": \"a\"}\n");
+    let b = write_temp_file(
+        "drift-b.ndjson",
+        "{\"id\": 1, \"name\": \"a\", \"country\": \"US\"}\n",
+    );
+
+    let out = Command::new(&pq)
+        .args([
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-i",
+            "ndjson",
+        ])
+        .output()
+        .expect("pq diff");
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+
+    // Drift → exit code 1 (CI-friendly).
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "drift must exit 1; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("## Added"),
+        "expected '## Added' in {stdout}"
+    );
+    assert!(stdout.contains("country"), "expected 'country' in {stdout}");
+}
+
+#[test]
+fn diff_json_format_emits_parseable_object() {
+    let pq = pq_binary();
+    if skip_if_missing(&pq, "pq binary") {
+        return;
+    }
+    let a = write_temp_file("jdiff-a.ndjson", "{\"id\": 1, \"name\": \"a\"}\n");
+    let b = write_temp_file(
+        "jdiff-b.ndjson",
+        "{\"id\": 1, \"name\": \"a\", \"new_field\": 42}\n",
+    );
+
+    let out = Command::new(&pq)
+        .args([
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-i",
+            "ndjson",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("pq diff json");
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(parsed["drift"], true);
+    assert_eq!(parsed["added"][0]["name"], "new_field");
+    assert_eq!(parsed["unchanged_count"], 2);
+}

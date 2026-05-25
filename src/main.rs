@@ -126,6 +126,30 @@ enum Cmd {
         #[arg(short = 'i', long, default_value = "auto")]
         input: String,
     },
+    /// Diff two files' schemas — column-level adds / drops / type changes
+    /// in markdown (or JSON for tooling). Exits non-zero if schemas
+    /// differ, zero if identical, so it slots into CI.
+    ///
+    /// Inputs may be parquet, ndjson, or csv (sniffed from extension or
+    /// pinned with `-i`). Comparison is by column name; type comparison
+    /// is exact-string (DuckDB's normalised type representation), so
+    /// `STRUCT(a INT, b VARCHAR)` and `STRUCT(b VARCHAR, a INT)` count
+    /// as different — usually the right call for catching drift.
+    Diff {
+        /// First (baseline) file.
+        a: String,
+        /// Second (new) file. Compared against `a`.
+        b: String,
+        /// Input format applied to BOTH files. `auto` sniffs each
+        /// independently from its extension.
+        #[arg(short = 'i', long, default_value = "auto")]
+        input: String,
+        /// Output format: `markdown` (human + GitHub-friendly) or `json`
+        /// (for CI tooling). `markdown` is the default.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+
     /// Per-column min / max / null / distinct stats.
     Stats {
         file: String,
@@ -466,6 +490,26 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) ->
         );
     }
 
+    // v0.14: pq diff a.parquet b.parquet — column-level schema drift in
+    // markdown (default) or JSON. Lives next to Tui in the early-return
+    // section because it has its own output (not a SQL result table) and
+    // its own exit-code semantics (1 on drift, 0 on identical).
+    if let Cmd::Diff {
+        a,
+        b,
+        input,
+        format,
+    } = cmd
+    {
+        let _spinner = progress::Spinner::maybe_start(cli.no_progress);
+        let report = run_diff(conn, a, b, input)?;
+        emit_diff_report(&report, format)?;
+        if report.has_drift() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // v0.9: subcommands also get stdin-spool + format dispatch. Each
     // variant carries its own `-i input`, so the resolution lives inline
     // here and we don't reach into the parent `Cli` for flags (which
@@ -478,6 +522,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) ->
         | Cmd::Tail { file, input, .. }
         | Cmd::Count { file, input, .. } => (file.clone(), input.as_str()),
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
+        Cmd::Diff { .. } => unreachable!("Diff handled before this match"),
     };
     let input_fmt = resolve_input_format(input_str, &raw_file)?;
     let spool = StdinSpool::resolve(&raw_file, input_fmt)?;
@@ -500,6 +545,7 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) ->
         ),
         Cmd::Count { lite, .. } => count_sql(&spool.resolved, input_fmt, *lite, &src),
         Cmd::Tui { .. } => unreachable!("Tui handled before this match"),
+        Cmd::Diff { .. } => unreachable!("Diff handled before this match"),
     };
 
     let _spinner = progress::Spinner::maybe_start(cli.no_progress);
@@ -660,6 +706,252 @@ fn fmt_bytes(n: u64) -> String {
         format!("{:.0} {}", v, UNITS[i])
     } else {
         format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+// ── v0.14: pq diff ──────────────────────────────────────────────────────────
+
+/// One column's metadata as DuckDB sees it. Fed into `diff_schemas`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Column {
+    pub name: String,
+    pub ty: String,
+    pub nullable: bool,
+}
+
+/// Single-column drift outcome. `Same` is included so the renderer can
+/// optionally show "no change" rows (currently we only print drifting
+/// columns to keep markdown short, but JSON output exposes everything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColumnChange {
+    Added(Column),
+    Dropped(Column),
+    /// Same name in both files but type and/or nullability changed.
+    Changed {
+        name: String,
+        from: Column,
+        to: Column,
+    },
+    Same(Column),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiffReport {
+    pub a_path: String,
+    pub b_path: String,
+    pub changes: Vec<ColumnChange>,
+}
+
+impl DiffReport {
+    pub fn has_drift(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|c| !matches!(c, ColumnChange::Same(_)))
+    }
+}
+
+/// Compare two ordered column lists by name. Order in the output
+/// follows `a` first (Same / Changed / Dropped, in `a`'s original
+/// order), then any names only in `b` (Added, in `b`'s order).
+/// Stable so tests don't flake on hashmap iteration order.
+pub(crate) fn diff_schemas(a: &[Column], b: &[Column]) -> Vec<ColumnChange> {
+    let mut out = Vec::new();
+    let b_by_name: std::collections::HashMap<&str, &Column> =
+        b.iter().map(|c| (c.name.as_str(), c)).collect();
+    let a_names: std::collections::HashSet<&str> = a.iter().map(|c| c.name.as_str()).collect();
+
+    for col_a in a {
+        match b_by_name.get(col_a.name.as_str()) {
+            None => out.push(ColumnChange::Dropped(col_a.clone())),
+            Some(col_b) if col_a == *col_b => out.push(ColumnChange::Same(col_a.clone())),
+            Some(col_b) => out.push(ColumnChange::Changed {
+                name: col_a.name.clone(),
+                from: col_a.clone(),
+                to: (*col_b).clone(),
+            }),
+        }
+    }
+    for col_b in b {
+        if !a_names.contains(col_b.name.as_str()) {
+            out.push(ColumnChange::Added(col_b.clone()));
+        }
+    }
+    out
+}
+
+/// Pull a file's column list via `DESCRIBE SELECT * FROM <src>`.
+/// Bypasses the print pipeline because diff has its own output shape.
+fn fetch_schema(conn: &Connection, file: &str, input: &str) -> Result<Vec<Column>> {
+    let input_fmt = resolve_input_format(input, file)?;
+    let spool = StdinSpool::resolve(file, input_fmt)?;
+    let src = parser::source_clause_fmt(&spool.resolved, input_fmt);
+    let sql = format!(
+        "SELECT column_name, column_type, \"null\" AS nullable \
+         FROM (DESCRIBE SELECT * FROM {src})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        let ty: String = row.get(1)?;
+        // DESCRIBE's "null" column is the literal string "YES"/"NO".
+        let nullable_str: String = row.get(2)?;
+        out.push(Column {
+            name,
+            ty,
+            nullable: nullable_str.eq_ignore_ascii_case("YES"),
+        });
+    }
+    Ok(out)
+}
+
+fn run_diff(conn: &Connection, a: &str, b: &str, input: &str) -> Result<DiffReport> {
+    let cols_a = fetch_schema(conn, a, input)?;
+    let cols_b = fetch_schema(conn, b, input)?;
+    Ok(DiffReport {
+        a_path: a.to_string(),
+        b_path: b.to_string(),
+        changes: diff_schemas(&cols_a, &cols_b),
+    })
+}
+
+fn emit_diff_report(report: &DiffReport, format: &str) -> Result<()> {
+    match format {
+        "json" => {
+            let json = render_diff_json(report);
+            println!("{json}");
+        }
+        "markdown" | "md" => {
+            print!("{}", render_diff_markdown(report));
+        }
+        other => {
+            return Err(anyhow!(
+                "unknown --format `{other}` for `pq diff` (expected `markdown` or `json`)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn render_diff_markdown(report: &DiffReport) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "# Schema diff");
+    let _ = writeln!(s, "- a: `{}`", report.a_path);
+    let _ = writeln!(s, "- b: `{}`", report.b_path);
+    let _ = writeln!(s);
+
+    if !report.has_drift() {
+        let _ = writeln!(s, "**No drift** — schemas are identical.");
+        return s;
+    }
+
+    let mut added: Vec<&Column> = Vec::new();
+    let mut dropped: Vec<&Column> = Vec::new();
+    let mut changed: Vec<(&str, &Column, &Column)> = Vec::new();
+    for ch in &report.changes {
+        match ch {
+            ColumnChange::Added(c) => added.push(c),
+            ColumnChange::Dropped(c) => dropped.push(c),
+            ColumnChange::Changed { name, from, to } => changed.push((name.as_str(), from, to)),
+            ColumnChange::Same(_) => {}
+        }
+    }
+
+    if !added.is_empty() {
+        let _ = writeln!(s, "## Added ({})", added.len());
+        let _ = writeln!(s, "| column | type | nullable |");
+        let _ = writeln!(s, "|---|---|---|");
+        for c in &added {
+            let _ = writeln!(s, "| `{}` | `{}` | {} |", c.name, c.ty, yesno(c.nullable));
+        }
+        let _ = writeln!(s);
+    }
+    if !dropped.is_empty() {
+        let _ = writeln!(s, "## Dropped ({})", dropped.len());
+        let _ = writeln!(s, "| column | type | nullable |");
+        let _ = writeln!(s, "|---|---|---|");
+        for c in &dropped {
+            let _ = writeln!(s, "| `{}` | `{}` | {} |", c.name, c.ty, yesno(c.nullable));
+        }
+        let _ = writeln!(s);
+    }
+    if !changed.is_empty() {
+        let _ = writeln!(s, "## Changed ({})", changed.len());
+        let _ = writeln!(s, "| column | from | to |");
+        let _ = writeln!(s, "|---|---|---|");
+        for (name, from, to) in &changed {
+            let _ = writeln!(
+                s,
+                "| `{}` | `{}` ({}) | `{}` ({}) |",
+                name,
+                from.ty,
+                yesno(from.nullable),
+                to.ty,
+                yesno(to.nullable)
+            );
+        }
+        let _ = writeln!(s);
+    }
+    s
+}
+
+fn render_diff_json(report: &DiffReport) -> String {
+    let added: Vec<_> = report
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            ColumnChange::Added(col) => Some(col_to_json(col)),
+            _ => None,
+        })
+        .collect();
+    let dropped: Vec<_> = report
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            ColumnChange::Dropped(col) => Some(col_to_json(col)),
+            _ => None,
+        })
+        .collect();
+    let changed: Vec<_> = report
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            ColumnChange::Changed { name, from, to } => Some(serde_json::json!({
+                "name": name,
+                "from": col_to_json(from),
+                "to": col_to_json(to),
+            })),
+            _ => None,
+        })
+        .collect();
+    let unchanged_count = report
+        .changes
+        .iter()
+        .filter(|c| matches!(c, ColumnChange::Same(_)))
+        .count();
+    let value = serde_json::json!({
+        "a": report.a_path,
+        "b": report.b_path,
+        "drift": report.has_drift(),
+        "added": added,
+        "dropped": dropped,
+        "changed": changed,
+        "unchanged_count": unchanged_count,
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
+fn col_to_json(c: &Column) -> serde_json::Value {
+    serde_json::json!({"name": c.name, "type": c.ty, "nullable": c.nullable})
+}
+
+fn yesno(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
     }
 }
 
@@ -860,5 +1152,188 @@ mod tests {
             sql.contains("SUMMARIZE"),
             "default stats path should be SUMMARIZE; got: {sql}"
         );
+    }
+
+    // ── v0.14: pq diff classifier + renderers ──────────────────────────────
+
+    fn col(name: &str, ty: &str, nullable: bool) -> Column {
+        Column {
+            name: name.into(),
+            ty: ty.into(),
+            nullable,
+        }
+    }
+
+    #[test]
+    fn diff_schemas_identical_emits_only_same() {
+        let cols = vec![col("id", "BIGINT", false), col("name", "VARCHAR", true)];
+        let changes = diff_schemas(&cols, &cols);
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes.iter().all(|c| matches!(c, ColumnChange::Same(_))),
+            "identical schemas must produce only Same: {changes:?}"
+        );
+        let report = DiffReport {
+            a_path: "a.parquet".into(),
+            b_path: "b.parquet".into(),
+            changes,
+        };
+        assert!(!report.has_drift(), "identical schemas → no drift");
+    }
+
+    #[test]
+    fn diff_schemas_added_dropped_changed() {
+        let a = vec![
+            col("id", "BIGINT", false),
+            col("removed_col", "DOUBLE", true),
+            col("changed_col", "VARCHAR", true),
+        ];
+        let b = vec![
+            col("id", "BIGINT", false),
+            col("changed_col", "BIGINT", false),
+            col("new_col", "TIMESTAMP", true),
+        ];
+        let changes = diff_schemas(&a, &b);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, ColumnChange::Same(col) if col.name == "id")));
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, ColumnChange::Dropped(col) if col.name == "removed_col")));
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, ColumnChange::Added(col) if col.name == "new_col")));
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            ColumnChange::Changed { name, from, to }
+                if name == "changed_col" && from.ty == "VARCHAR" && to.ty == "BIGINT"
+        )));
+    }
+
+    #[test]
+    fn diff_schemas_nullability_change_is_changed_not_same() {
+        // Same name + type but different nullability → still drift.
+        // Important: making a non-null column nullable is usually a
+        // breaking change for downstream consumers.
+        let a = vec![col("email", "VARCHAR", false)];
+        let b = vec![col("email", "VARCHAR", true)];
+        let changes = diff_schemas(&a, &b);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            ColumnChange::Changed { from, to, .. } => {
+                assert_eq!(from.ty, to.ty);
+                assert!(!from.nullable && to.nullable);
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_schemas_preserves_a_order_then_added() {
+        // Deterministic output order: a's columns in original order,
+        // then b's added columns in their order. No hashmap nondeterminism.
+        let a = vec![col("zebra", "BIGINT", false), col("apple", "VARCHAR", true)];
+        let b = vec![
+            col("apple", "VARCHAR", true),
+            col("banana", "DATE", true),
+            col("zebra", "BIGINT", false),
+        ];
+        let changes = diff_schemas(&a, &b);
+        let names: Vec<&str> = changes
+            .iter()
+            .map(|c| match c {
+                ColumnChange::Same(col) | ColumnChange::Added(col) | ColumnChange::Dropped(col) => {
+                    col.name.as_str()
+                }
+                ColumnChange::Changed { name, .. } => name.as_str(),
+            })
+            .collect();
+        // a-order: zebra, apple. Then added: banana.
+        assert_eq!(names, vec!["zebra", "apple", "banana"]);
+    }
+
+    #[test]
+    fn render_diff_markdown_no_drift_short_message() {
+        let report = DiffReport {
+            a_path: "a.parquet".into(),
+            b_path: "b.parquet".into(),
+            changes: vec![ColumnChange::Same(col("id", "BIGINT", false))],
+        };
+        let md = render_diff_markdown(&report);
+        assert!(md.contains("**No drift**"));
+        // Must NOT include section headers when there's no drift.
+        assert!(!md.contains("## Added"));
+        assert!(!md.contains("## Dropped"));
+        assert!(!md.contains("## Changed"));
+    }
+
+    #[test]
+    fn render_diff_markdown_drift_has_sections() {
+        let report = DiffReport {
+            a_path: "a.parquet".into(),
+            b_path: "b.parquet".into(),
+            changes: vec![
+                ColumnChange::Same(col("id", "BIGINT", false)),
+                ColumnChange::Dropped(col("legacy", "VARCHAR", true)),
+                ColumnChange::Added(col("new_col", "DATE", true)),
+                ColumnChange::Changed {
+                    name: "amount".into(),
+                    from: col("amount", "DOUBLE", true),
+                    to: col("amount", "DECIMAL(10,2)", false),
+                },
+            ],
+        };
+        let md = render_diff_markdown(&report);
+        assert!(md.contains("## Added (1)"));
+        assert!(md.contains("## Dropped (1)"));
+        assert!(md.contains("## Changed (1)"));
+        assert!(md.contains("`legacy`"));
+        assert!(md.contains("`new_col`"));
+        assert!(md.contains("`amount`"));
+        assert!(md.contains("DECIMAL(10,2)"));
+        // Same-row columns must NOT appear in markdown — they'd be noise.
+        assert!(
+            !md.contains("`id`"),
+            "Same columns should not appear in markdown body"
+        );
+    }
+
+    #[test]
+    fn render_diff_json_shape_round_trips() {
+        let report = DiffReport {
+            a_path: "a.parquet".into(),
+            b_path: "b.parquet".into(),
+            changes: vec![
+                ColumnChange::Same(col("id", "BIGINT", false)),
+                ColumnChange::Added(col("new_col", "DATE", true)),
+            ],
+        };
+        let json = render_diff_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["a"], "a.parquet");
+        assert_eq!(parsed["b"], "b.parquet");
+        assert_eq!(parsed["drift"], true);
+        assert_eq!(parsed["added"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["added"][0]["name"], "new_col");
+        assert_eq!(parsed["added"][0]["type"], "DATE");
+        assert_eq!(parsed["dropped"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["changed"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["unchanged_count"], 1);
+    }
+
+    #[test]
+    fn diff_report_has_drift_only_when_non_same_present() {
+        let only_same = DiffReport {
+            a_path: "a".into(),
+            b_path: "b".into(),
+            changes: vec![ColumnChange::Same(col("id", "BIGINT", false))],
+        };
+        assert!(!only_same.has_drift());
+        let with_added = DiffReport {
+            a_path: "a".into(),
+            b_path: "b".into(),
+            changes: vec![ColumnChange::Added(col("x", "INTEGER", true))],
+        };
+        assert!(with_added.has_drift());
     }
 }
