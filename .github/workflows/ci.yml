@@ -77,6 +77,17 @@ jobs:
           curl -fsSL "https://github.com/charmbracelet/vhs/releases/download/${VHS_VERSION}/vhs_${VHS_VERSION#v}_amd64.deb" \
             -o /tmp/vhs.deb
           sudo apt-get update -qq
+          # ttyd is a runtime dep of vhs but the .deb on noble doesn't
+          # auto-resolve it; install explicitly. ffmpeg comes through
+          # the .deb's transitive deps fine.
+          sudo apt-get install -y ttyd
+          if ! command -v ttyd >/dev/null 2>&1; then
+            # Fallback: noble universe may not have ttyd; pull the
+            # upstream prebuilt binary.
+            sudo curl -fsSL https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64 \
+              -o /usr/local/bin/ttyd
+            sudo chmod +x /usr/local/bin/ttyd
+          fi
           sudo apt-get install -y /tmp/vhs.deb
           vhs --version
           ffmpeg -version | head -1
