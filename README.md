@@ -26,6 +26,16 @@ $ pq sales.parquet 'group_by .country | sum .revenue | top 3 by sum_revenue'
 
 ![demo](assets/demo.gif)
 
+## Documentation
+
+- 📘 [**Tutorial**](doc/tutorial.md) — 30-minute hands-on walkthrough.
+  Setup, the DSL pipeline mental model, nested types, unix-pipe composition,
+  TUI usage, big-file mode (v0.12 + v0.13). Read this first.
+- 📚 [**Reference manual**](doc/reference.md) — feature-by-feature lookup
+  catalogue: every DSL stage, every TUI key binding, every env var, every
+  output format. Use this when you know what you want to do but need the
+  exact syntax.
+
 ## Why?
 
 The current options for ad-hoc parquet querying are all painful:
