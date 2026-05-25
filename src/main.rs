@@ -60,14 +60,14 @@ struct Cli {
     query: Option<String>,
 
     /// Output: auto | table | json | ndjson | csv | parquet
-    #[arg(short, long, default_value = "auto")]
+    #[arg(short, long, default_value = "auto", global = true)]
     output: String,
 
     /// Input format: auto | parquet | ndjson (jsonl/json) | csv (tsv).
     /// `auto` sniffs from file extension (.ndjson/.csv → matching reader,
     /// otherwise parquet). For stdin (`-`) auto means parquet — pass an
     /// explicit `-i ndjson` to chain `pq f.parquet '...' | pq -i ndjson '...'`.
-    #[arg(short = 'i', long, default_value = "auto")]
+    #[arg(short = 'i', long, default_value = "auto", global = true)]
     input: String,
 
     /// Row limit for default head; default 20. Use 0 for no limit.
@@ -76,7 +76,7 @@ struct Cli {
     n: usize,
 
     /// Show the SQL pq would run, but don't execute (for debugging the parser)
-    #[arg(long)]
+    #[arg(long, global = true)]
     explain: bool,
 
     /// Watch mode: re-run the query every N seconds (clearing the screen between
@@ -518,7 +518,8 @@ fn run_subcommand(conn: &Connection, cmd: &Cmd, fmt: OutputFormat, cli: &Cli) ->
 /// 40 GB local file this is the difference between seconds and a
 /// fraction of a second; on globs it's per-file row counts summed.
 fn count_sql(resolved_path: &str, input_fmt: InputFormat, forced: bool, src: &str) -> String {
-    let auto = should_auto_lite(resolved_path);
+    let threshold = lite_threshold();
+    let auto = should_auto_lite(resolved_path, threshold);
     if input_fmt == InputFormat::Parquet && (forced || auto) {
         let escaped = resolved_path.replace('\'', "''");
         if auto && !forced {
@@ -527,7 +528,7 @@ fn count_sql(resolved_path: &str, input_fmt: InputFormat, forced: bool, src: &st
             // user redirected stderr too; that's their call.
             eprintln!(
                 "pq: lite mode (file >= {}; reading row count from parquet footer)",
-                fmt_bytes(lite_threshold())
+                fmt_bytes(threshold)
             );
         }
         format!("SELECT sum(num_rows)::BIGINT AS rows FROM parquet_file_metadata('{escaped}')")
@@ -556,13 +557,14 @@ fn count_sql(resolved_path: &str, input_fmt: InputFormat, forced: bool, src: &st
 ///     stats for nested array elements) but it does mean rows don't
 ///     line up 1:1 with the top-level schema.
 fn stats_sql(resolved_path: &str, input_fmt: InputFormat, forced: bool, src: &str) -> String {
-    let auto = should_auto_lite(resolved_path);
+    let threshold = lite_threshold();
+    let auto = should_auto_lite(resolved_path, threshold);
     if input_fmt == InputFormat::Parquet && (forced || auto) {
         let escaped = resolved_path.replace('\'', "''");
         if auto && !forced {
             eprintln!(
                 "pq: lite mode (file >= {}; reading column stats from parquet footer)",
-                fmt_bytes(lite_threshold())
+                fmt_bytes(threshold)
             );
         }
         // any_value(type) is fine here — Parquet schema metadata is
@@ -610,11 +612,10 @@ fn lite_threshold() -> u64 {
 /// expansion fails (DuckDB-side glob, can't tell from here), we
 /// conservatively return false — the slow path still works, just
 /// without the lite shortcut.
-fn should_auto_lite(path: &str) -> bool {
+fn should_auto_lite(path: &str, threshold: u64) -> bool {
     if path.contains("://") {
         return false;
     }
-    let threshold = lite_threshold();
     if let Some(ix) = path.find(['*', '?', '[']) {
         // Glob: walk siblings of the directory before the first
         // wildcard. We cap at 64 entries so a `**` that matches
@@ -665,6 +666,7 @@ fn fmt_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
 
     #[test]
@@ -679,14 +681,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn lite_threshold_default_is_one_gb() {
         // PQ_LITE_THRESHOLD must NOT be set during this test for the
         // default to apply. Tests in this module run in-process so an
         // env var set by a sibling test could leak through; clear
         // defensively to keep this test order-independent.
-        // SAFETY: env access is process-global; we don't run this
-        // module's tests in parallel against fixtures that depend on
-        // the env var.
+        // SAFETY: env access is process-global; we serialize this test
+        // to prevent races with sibling tests that mutate the env.
         unsafe {
             std::env::remove_var("PQ_LITE_THRESHOLD");
         }
@@ -694,6 +696,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn lite_threshold_honors_override() {
         // SAFETY: see lite_threshold_default_is_one_gb.
         unsafe {
@@ -709,37 +712,34 @@ mod tests {
     fn auto_lite_skips_remote_paths() {
         // Cloud paths always return false — checking sizes over the
         // network would be a footgun on `pq schema gs://huge.parquet`.
-        assert!(!should_auto_lite("gs://bucket/big.parquet"));
-        assert!(!should_auto_lite("s3://b/x.parquet"));
-        assert!(!should_auto_lite("https://example.com/x.parquet"));
+        let threshold = 1; // arbitrary; remote paths always skip
+        assert!(!should_auto_lite("gs://bucket/big.parquet", threshold));
+        assert!(!should_auto_lite("s3://b/x.parquet", threshold));
+        assert!(!should_auto_lite(
+            "https://example.com/x.parquet",
+            threshold
+        ));
     }
 
     #[test]
     fn auto_lite_below_threshold_returns_false() {
-        // A small temp file shouldn't trip the default 1 GB threshold.
+        // A small temp file shouldn't trip a large threshold.
         let mut f = tempfile::NamedTempFile::new().expect("tmpfile");
         f.write_all(b"hello").expect("write");
         let path = f.path().to_string_lossy().into_owned();
-        // Force default threshold so this test stays deterministic.
-        unsafe {
-            std::env::remove_var("PQ_LITE_THRESHOLD");
-        }
-        assert!(!should_auto_lite(&path));
+        // Pass a large threshold so the 5-byte file stays below it.
+        let large_threshold = 1024 * 1024 * 1024; // 1 GB
+        assert!(!should_auto_lite(&path, large_threshold));
     }
 
     #[test]
     fn auto_lite_above_threshold_returns_true() {
-        // Set the threshold to 1 byte so any non-empty file qualifies.
+        // Pass a threshold of 1 byte so any non-empty file qualifies.
         let mut f = tempfile::NamedTempFile::new().expect("tmpfile");
         f.write_all(b"hello").expect("write");
         let path = f.path().to_string_lossy().into_owned();
-        unsafe {
-            std::env::set_var("PQ_LITE_THRESHOLD", "1");
-        }
-        assert!(should_auto_lite(&path));
-        unsafe {
-            std::env::remove_var("PQ_LITE_THRESHOLD");
-        }
+        // No env var mutations needed — pass threshold directly.
+        assert!(should_auto_lite(&path, 1));
     }
 
     #[test]

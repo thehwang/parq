@@ -96,6 +96,7 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
         OutputFormat::Ndjson => return stream_ndjson(&column_names, &mut rows, ncols),
         OutputFormat::Csv => return stream_csv(&column_names, &mut rows, ncols),
         OutputFormat::RawLines => return stream_raw_lines(&mut rows),
+        OutputFormat::Json => return stream_json(&column_names, &mut rows, ncols),
         _ => {}
     }
 
@@ -110,8 +111,7 @@ pub fn run_and_print(conn: &Connection, sql: &str, fmt: OutputFormat) -> Result<
 
     match fmt {
         OutputFormat::Table => print_table(&column_names, &collected),
-        OutputFormat::Json => print_json(&column_names, &collected),
-        OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::RawLines => {
+        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Csv | OutputFormat::RawLines => {
             unreachable!("streamed earlier")
         }
         OutputFormat::Parquet => unreachable!("Parquet handled before row iteration"),
@@ -161,6 +161,32 @@ fn stream_raw_lines(rows: &mut duckdb::Rows<'_>) -> Result<()> {
         };
         writeln!(h, "{}", line)?;
     }
+    Ok(())
+}
+
+fn stream_json(cols: &[String], rows: &mut duckdb::Rows<'_>, ncols: usize) -> Result<()> {
+    let stdout = io::stdout();
+    let mut h = stdout.lock();
+    write!(h, "[")?;
+
+    let mut first = true;
+    while let Some(row) = rows.next()? {
+        let mut r = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            r.push(row.get::<usize, Value>(i).unwrap_or(Value::Null));
+        }
+
+        if first {
+            writeln!(h)?;
+            first = false;
+        } else {
+            writeln!(h, ",")?;
+        }
+
+        write!(h, "{}", serde_json::to_string(&row_to_json(cols, &r))?)?;
+    }
+
+    write!(h, "\n]\n")?;
     Ok(())
 }
 
@@ -221,12 +247,6 @@ fn print_table(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
     let stderr = io::stderr();
     let mut h = stderr.lock();
     let _ = writeln!(h, "({} rows)", rows.len());
-    Ok(())
-}
-
-fn print_json(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
-    let arr: Vec<JsonValue> = rows.iter().map(|r| row_to_json(cols, r)).collect();
-    println!("{}", serde_json::to_string_pretty(&JsonValue::Array(arr))?);
     Ok(())
 }
 

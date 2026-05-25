@@ -59,6 +59,7 @@ ctrlc = { version = "3.4", features = ["termination"] }
 # diff it against committed `*.snap` files. Keeps regressions in
 # layout / labels / panel composition from sneaking in unnoticed.
 insta = "1.40"
+serial_test = "3"
 
 [profile.release]
 opt-level = 3

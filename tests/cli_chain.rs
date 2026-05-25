@@ -338,3 +338,68 @@ fn stats_lite_returns_per_column_metadata() {
         "lite mode should not surface null_pct: {first}"
     );
 }
+
+/// JSON streaming: validate that -o json produces a valid JSON array with
+/// proper brackets and comma separators. Issue #2 acceptance criteria: the
+/// output must stream directly to stdout (no buffering) while remaining a
+/// valid JSON document.
+#[test]
+fn json_streaming_writes_brackets_and_separators() {
+    let pq = pq_binary();
+    let sample = sample_parquet();
+    if skip_if_missing(&pq, "pq binary") || skip_if_missing(&sample, "sample.parquet") {
+        return;
+    }
+    let out = Command::new(&pq)
+        .args([sample.to_str().unwrap(), "-o", "json"])
+        .output()
+        .expect("pq json");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Validate structure: must start with '[' and end with ']'
+    let trimmed = stdout.trim();
+    assert!(
+        trimmed.starts_with('['),
+        "JSON streaming must start with '[', got: {}",
+        &trimmed[..trimmed.len().min(50)]
+    );
+    assert!(
+        trimmed.ends_with(']'),
+        "JSON streaming must end with ']', got: {}",
+        &trimmed[trimmed.len().saturating_sub(50)..]
+    );
+
+    // Parse as JSON to ensure validity and check structure
+    let parsed: serde_json::Result<Vec<serde_json::Value>> = serde_json::from_str(trimmed);
+    assert!(
+        parsed.is_ok(),
+        "JSON output must be a valid JSON array, got parse error: {}",
+        parsed.unwrap_err()
+    );
+
+    let arr = parsed.unwrap();
+    assert!(!arr.is_empty(), "JSON array must contain at least one row");
+
+    // Verify each row is a JSON object
+    for (i, row) in arr.iter().enumerate() {
+        assert!(
+            row.is_object(),
+            "row {} must be a JSON object, got: {}",
+            i,
+            row
+        );
+    }
+
+    // Validate comma-separation at the string level (smoke test that
+    // incremental writer placed separators correctly). Between rows
+    // we expect `},\n{`.
+    let has_comma_separator = stdout.contains("},\n{");
+    if arr.len() > 1 {
+        assert!(
+            has_comma_separator,
+            "multiple rows must be separated by `,\\n`, but got: {}",
+            &stdout[..stdout.len().min(200)]
+        );
+    }
+}
