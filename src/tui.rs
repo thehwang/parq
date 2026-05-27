@@ -403,9 +403,16 @@ fn walk_json_for_parquet(node: &serde_json::Value, out: &mut Vec<(u64, String)>)
         .map(|s| s == "READ_PARQUET")
         .unwrap_or(false);
     if is_parquet {
-        // Both fields must be present; if either is missing we can't
-        // compute a pruning ratio for this scan and silently skip it.
-        let rows = node.get("operator_rows_scanned").and_then(|v| v.as_u64());
+        // v0.14.1 (#12 follow-up): use `operator_cardinality`, NOT
+        // `operator_rows_scanned`. Empirically against DuckDB 1.10.501,
+        // `operator_rows_scanned` for READ_PARQUET is ~10x the file's
+        // physical row count (likely an internal multi-pass / per-thread
+        // accumulator), which produced the comically wrong "pruned: 0%
+        // (25.0M/5.0M rows)" line on the v0.14 cover image.
+        // `operator_cardinality` is the rows-out-of-scan count after
+        // predicate pushdown — exactly the numerator we want for the
+        // pruning gauge: (1 - cardinality / file_total_rows).
+        let rows = node.get("operator_cardinality").and_then(|v| v.as_u64());
         let filename = node
             .get("extra_info")
             .and_then(|e| e.get("Filename(s)"))
@@ -446,7 +453,14 @@ fn try_collect_json_scans(conn: &Connection, sql: &str) -> Option<Vec<(u64, Stri
     // Always restore default profiling state so subsequent queries
     // (preview ticks, suggestions sql, etc.) don't get JSON output
     // shoved in their first column.
-    let _ = conn.execute("PRAGMA disable_profiling", []);
+    //
+    // v0.14.1 (#12): `PRAGMA disable_profiling` looks like the obvious
+    // reset but it's a silent no-op against DuckDB 1.10.501 — the
+    // pragma accepts the call without erroring but EXPLAIN ANALYZE
+    // keeps returning JSON in column 1. The documented inverse is
+    // `enable_profiling='no_output'`, which actually flips the bit.
+    // Verified empirically; the regression test below pins this.
+    let _ = conn.execute("PRAGMA enable_profiling='no_output'", []);
     let _ = conn.execute("PRAGMA profiling_mode='standard'", []);
     result
 }
@@ -3855,11 +3869,16 @@ TABLE_SCAN
 
     // ── v0.14: JSON profile parsing for row-group pruning ──────────────────
 
-    fn json_scan_node(rows_scanned: u64, filename: &str) -> serde_json::Value {
+    fn json_scan_node(scan_rows: u64, filename: &str) -> serde_json::Value {
+        // `operator_cardinality` is the post-pushdown row count (what
+        // we actually want for the pruning gauge). Real DuckDB profiles
+        // also carry `operator_rows_scanned` but that field is unsafe
+        // to use — see the comment in walk_json_for_parquet for why.
         serde_json::json!({
             "operator_name": "READ_PARQUET",
             "operator_type": "TABLE_SCAN",
-            "operator_rows_scanned": rows_scanned,
+            "operator_cardinality": scan_rows,
+            "operator_rows_scanned": scan_rows * 10, // realistic decoy
             "extra_info": {
                 "Function": "READ_PARQUET",
                 "Filename(s)": filename,
@@ -3905,7 +3924,7 @@ TABLE_SCAN
 
     #[test]
     fn collect_json_parquet_scans_skips_missing_fields() {
-        // Node missing operator_rows_scanned → skipped. Node missing
+        // Node missing operator_cardinality → skipped. Node missing
         // Filename(s) in extra_info → skipped. We don't panic on either.
         let profile = serde_json::json!({
             "children": [
@@ -3916,7 +3935,7 @@ TABLE_SCAN
                 },
                 {
                     "operator_name": "READ_PARQUET",
-                    "operator_rows_scanned": 5,
+                    "operator_cardinality": 5,
                     "extra_info": {},
                     "children": []
                 },
@@ -3954,6 +3973,65 @@ TABLE_SCAN
         assert!(
             scans.is_empty(),
             "non-parquet ops must not be collected: {scans:?}"
+        );
+    }
+
+    /// v0.14.1 regression for #12. The naive reset of
+    /// `PRAGMA enable_profiling='json'` is `PRAGMA disable_profiling`,
+    /// but against DuckDB 1.10.501 that's a silent no-op — the profile
+    /// state stays in JSON mode and subsequent EXPLAIN ANALYZE calls
+    /// return JSON in column 1, which when rendered as the Explain
+    /// panel's `e.raw` fallback or as the Data panel's row content
+    /// looks like garbage on screen.
+    ///
+    /// The test opens a fresh in-memory duckdb connection (so we don't
+    /// depend on pq's open_conn or any test fixtures), runs the full
+    /// `try_collect_json_scans` round-trip, and then asserts that a
+    /// follow-up plain EXPLAIN returns text-shaped output, NOT JSON.
+    #[test]
+    fn try_collect_json_scans_resets_profile_for_subsequent_explains() {
+        let conn = duckdb::Connection::open_in_memory().expect("in-memory conn");
+        // Make a tiny parquet so EXPLAIN ANALYZE has something real to
+        // run against. Could mock with VALUES, but a parquet path
+        // exercises the same code path the TUI does.
+        let path = std::env::temp_dir().join(format!(
+            "pq-pragma-reset-{}-{}.parquet",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        conn.execute(
+            &format!("COPY (SELECT range AS id FROM range(100)) TO '{path_str}'"),
+            [],
+        )
+        .expect("copy");
+
+        let sql = format!("SELECT id FROM read_parquet('{path_str}') WHERE id < 5");
+
+        // Round-trip: this must leave profiling DISABLED on exit.
+        let _ = try_collect_json_scans(&conn, &sql);
+
+        // Now check that a subsequent plain EXPLAIN returns text, not
+        // JSON. The text plan starts with a box-drawing char (┌); a
+        // JSON document starts with `{`. We sniff the first non-whitespace
+        // char rather than trying to parse, so the test stays readable.
+        let mut stmt = conn.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let row = rows.next().unwrap().expect("plan row");
+        let plan: String = row.get(1).unwrap();
+        let first = plan.trim_start().chars().next().unwrap_or(' ');
+
+        let _ = std::fs::remove_file(&path);
+
+        assert_ne!(
+            first,
+            '{',
+            "PRAGMA reset failed — EXPLAIN returned JSON ({first:?} prefix). \
+             Plan starts with: {prefix}",
+            prefix = &plan[..plan.len().min(80)]
         );
     }
 

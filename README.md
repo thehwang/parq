@@ -234,12 +234,12 @@ export AWS_SECRET_ACCESS_KEY=…
 pq s3://my-bucket/file.parquet | head
 
 # S3 — named profile from ~/.aws/credentials (no env vars needed)
-export AWS_PROFILE=cadent-prod
+export AWS_PROFILE=my-prod
 pq schema s3://my-bucket/file.parquet
 
 # S3 — SSO  (works once `aws sso login` cached a token)
-aws sso login --profile=cadent-sso
-AWS_PROFILE=cadent-sso pq schema s3://my-bucket/file.parquet
+aws sso login --profile=my-sso
+AWS_PROFILE=my-sso pq schema s3://my-bucket/file.parquet
 
 # S3 — IAM role on EC2 / ECS  (no creds anywhere — chain pulls from IMDS / task role)
 pq s3://my-bucket/file.parquet
