@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question / usage help
+    url: https://github.com/thehwang/parq/blob/main/doc/tutorial.md
+    about: Check the 30-minute tutorial and the reference manual before filing — most "how do I…" answers live there.
